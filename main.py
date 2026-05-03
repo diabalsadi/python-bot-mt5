@@ -1,25 +1,278 @@
+"""
+Gold Scalper — Python Edition
+=================================
+Main entry point.  Mirrors the MQL5 EA's OnInit() + OnTick() loop.
+
+Run:
+    python main.py
+"""
+
+import time
+import os
+import logging
+
 import MetaTrader5 as mt5
-from actions.buy import buy_market
-from actions.sell import sell_market
+
+logging.basicConfig(
+    filename="latency.log",
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
 from actions.connection import initialize_connection
+from actions.strategy import (
+    cancel_all_orders,
+    cancel_stale_orders,
+    check_latency,
+    check_us_session_exclusion,
+    execute_buy_limit,
+    execute_sell_limit,
+    get_market_session,
+    get_ml_entry_levels,
+    trail_sltp,
+)
+from indicators.atr import check_high_volatility
+from ml.model import LinearRegressionModel
 from mt5_tool.symbol import get_symbol, stream_ticks
 from tools.print import pretty_print
 
-if __name__ == "__main__":
-    initialize_connection()
+# ──────────────────────────────────────────────────────────────────────
+# Configuration  (mirrors MQL5 input block)
+# ──────────────────────────────────────────────────────────────────────
+SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSDm")
+TIMEFRAME = mt5.TIMEFRAME_M1
 
-    # Pretty print account info
+# ML
+ML_TRAINING_BARS = 150
+ML_FEATURE_WINDOW = 12
+ML_RETRAIN_INTERVAL = 10  # bars between retrains
+ML_PREDICTION_HORIZON = 15
+
+# Indicators
+RSI_PERIOD = 14
+EMA_PERIOD = 50
+ATR_PERIOD = 14
+TREND_BARS = 5
+
+# Risk / order management
+SL_POINTS = 2000
+RISK_PERCENT = 10.0
+TRAILING_STEP_POINTS = 100
+EXPIRATION_HOURS = 50
+MIN_ORDER_DISTANCE_PTS = 500
+RESET_ORDERS_INTERVAL = 30  # minutes
+
+# Protection
+AVOID_HIGH_VOLATILITY = True
+VOLATILITY_MULTIPLIER = 2.0
+MAX_LATENCY_MS = 2000
+ENABLE_LATENCY_CHECK = True
+USE_US_OPEN_PROTECTION = True
+US_OPEN_PROTECTION_HRS = 2
+US_START_HOUR = 15
+
+
+# ──────────────────────────────────────────────────────────────────────
+# State
+# ──────────────────────────────────────────────────────────────────────
+model = LinearRegressionModel()
+total_bars = 0
+ml_train_counter = 0
+last_deletion_ts = 0.0
+last_tick_time_msc = 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _bars_available() -> int:
+    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
+    if rates is None:
+        return 0
+    return int(
+        mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 5000).shape[0]
+    )  # approximate
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Main loop
+# ──────────────────────────────────────────────────────────────────────
+
+
+def on_tick() -> None:
+    """Called on every price tick — mirrors MQL5 OnTick()."""
+    global total_bars, ml_train_counter, last_deletion_ts, last_tick_time_msc
+
+    # Measure tick latency
+    t0 = time.perf_counter()
+    tick = mt5.symbol_info_tick(SYMBOL)
+    app_terminal_speed_ms = int((time.perf_counter() - t0) * 1000)
+
+    if tick is not None and tick.time_msc != last_tick_time_msc:
+        last_tick_time_msc = tick.time_msc
+
+        terminal_info = mt5.terminal_info()
+        broker_ping_ms = int(terminal_info.ping_last / 1000) if terminal_info else 0
+
+        logging.info(
+            f"PRICE UPDATE | {SYMBOL} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | Broker Ping: {broker_ping_ms}ms | App-Terminal Speed: {app_terminal_speed_ms}ms"
+        )
+
+    # 1. US open protection (highest priority)
+    if USE_US_OPEN_PROTECTION and check_us_session_exclusion(
+        US_START_HOUR, US_OPEN_PROTECTION_HRS
+    ):
+        session = get_market_session(us_start=US_START_HOUR)
+        print(f"⚠️  PAUSED (US Open protection) | Session: {session}")
+        return
+
+    # 2. Latency guard
+    if ENABLE_LATENCY_CHECK:
+        ok, latency = check_latency(SYMBOL, MAX_LATENCY_MS)
+        if not ok:
+            print(f"⚠️  PAUSED (latency {latency} ms > {MAX_LATENCY_MS} ms)")
+            return
+
+    # 3. High-volatility guard
+    if AVOID_HIGH_VOLATILITY:
+        is_high, cur_atr, avg_atr = check_high_volatility(
+            SYMBOL, TIMEFRAME, ATR_PERIOD, VOLATILITY_MULTIPLIER
+        )
+        if is_high:
+            print(f"⚠️  PAUSED (high volatility) | ATR={cur_atr:.5f} avg={avg_atr:.5f}")
+            return
+
+    # 4. Periodic order reset
+    now = time.time()
+    if last_deletion_ts == 0:
+        last_deletion_ts = now
+    elif (now - last_deletion_ts) >= RESET_ORDERS_INTERVAL * 60:
+        print(f"🗑️  Resetting all pending orders ({RESET_ORDERS_INTERVAL} min interval)")
+        cancel_all_orders(SYMBOL)
+        last_deletion_ts = now
+
+    # 6. New-bar logic
+    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 2)
+    if rates is None:
+        return
+
+    bars = int(rates[0]["time"])  # unique per bar (timestamp of current bar)
+    if total_bars == bars:
+        # Same bar → only trail stops
+        trail_sltp(
+            SYMBOL, TIMEFRAME, TRAILING_STEP_POINTS, SL_POINTS, ML_FEATURE_WINDOW
+        )
+        return
+
+    total_bars = bars
+    ml_train_counter += 1
+
+    # 6a. Periodic model retraining
+    if ml_train_counter >= ML_RETRAIN_INTERVAL:
+        model.train(
+            SYMBOL,
+            TIMEFRAME,
+            ML_TRAINING_BARS,
+            ML_PREDICTION_HORIZON,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+        )
+        ml_train_counter = 0
+
+    # 6b. Get ML entry levels
+    buy_level, sell_level = get_ml_entry_levels(
+        SYMBOL,
+        TIMEFRAME,
+        TREND_BARS,
+        ML_FEATURE_WINDOW,
+        RSI_PERIOD,
+        EMA_PERIOD,
+        model,
+    )
+
+    # 6c. Cancel orders that contradict the current prediction
+    prediction = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
+    cancel_stale_orders(SYMBOL, prediction)
+
+    # 6d. Place new orders
+    if buy_level > 0:
+        execute_buy_limit(
+            SYMBOL,
+            TIMEFRAME,
+            buy_level,
+            SL_POINTS,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+            RISK_PERCENT,
+            EXPIRATION_HOURS,
+            MIN_ORDER_DISTANCE_PTS,
+            model,
+        )
+
+    if sell_level > 0:
+        execute_sell_limit(
+            SYMBOL,
+            TIMEFRAME,
+            sell_level,
+            SL_POINTS,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+            RISK_PERCENT,
+            EXPIRATION_HOURS,
+            MIN_ORDER_DISTANCE_PTS,
+            model,
+        )
+
+    # 7. Trail SL/TP every tick
+    trail_sltp(SYMBOL, TIMEFRAME, TRAILING_STEP_POINTS, SL_POINTS, ML_FEATURE_WINDOW)
+
+
+def main() -> None:
+    global model
+
+    initialize_connection()
     pretty_print(mt5.account_info(), "Account Info")
 
-    # Get correct symbol name
-    symbol = get_symbol("BTCUSD")
-    
-    # Note: BUY STOP pending orders may not work on all brokers/symbols
-    # If needed, manually set stop loss in MT5 through the platform UI
-    # buy_stop(symbol, volume=0.01, stop_price=80000)
-    # sell_stop(symbol, volume=0.01, stop_price=70000)
-    
-    if symbol:
-        stream_ticks(symbol, interval=1)
+    symbol = get_symbol(SYMBOL)
+    if not symbol:
+        mt5.shutdown()
+        return
 
-    mt5.shutdown()
+    # Initial model training
+    req_bars = (
+        ML_TRAINING_BARS + ML_PREDICTION_HORIZON + ML_FEATURE_WINDOW + RSI_PERIOD + 10
+    )
+    available = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, req_bars)
+    if available is not None and len(available) >= req_bars:
+        model.train(
+            symbol,
+            TIMEFRAME,
+            ML_TRAINING_BARS,
+            ML_PREDICTION_HORIZON,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+        )
+    else:
+        print(
+            f"⚠️  Not enough bars for initial training (need {req_bars}). "
+            "Model will train after enough bars accumulate."
+        )
+
+    print(f"\n🚀 Gold Scalper v3 running on {symbol} {TIMEFRAME} (Ctrl+C to stop)\n")
+
+    try:
+        while True:
+            on_tick()
+            time.sleep(0.1)  # ~10 ticks/sec; adjust as needed
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped by user")
+    finally:
+        mt5.shutdown()
+        print("👋 MT5 disconnected")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,55 @@
+2026-05-04 01:16:43 | PRICE UPDATE | XAUUSDm Bid: 4620.13800 Ask: 4620.41800 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:16:48 | PRICE UPDATE | XAUUSDm Bid: 4621.31000 Ask: 4621.61800 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:17:44 | PRICE UPDATE | XAUUSDm Bid: 4622.75900 Ask: 4623.06700 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:18:19 | PRICE UPDATE | XAUUSDm Bid: 4621.75700 Ask: 4622.06500 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:19:02 | PRICE UPDATE | XAUUSDm Bid: 4620.69300 Ask: 4621.00100 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:19:52 | PRICE UPDATE | XAUUSDm Bid: 4621.92400 Ask: 4622.23200 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:20:01 | PRICE UPDATE | XAUUSDm Bid: 4620.78500 Ask: 4621.06500 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:20:57 | PRICE UPDATE | XAUUSDm Bid: 4619.75700 Ask: 4620.06500 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:21:13 | PRICE UPDATE | XAUUSDm Bid: 4621.16600 Ask: 4621.47400 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:21:27 | PRICE UPDATE | XAUUSDm Bid: 4619.88300 Ask: 4620.24300 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:21:49 | PRICE UPDATE | XAUUSDm Bid: 4618.86100 Ask: 4619.16900 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:21:57 | PRICE UPDATE | XAUUSDm Bid: 4617.43700 Ask: 4617.74500 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:21:58 | PRICE UPDATE | XAUUSDm Bid: 4616.17500 Ask: 4616.53500 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:22:03 | PRICE UPDATE | XAUUSDm Bid: 4614.88000 Ask: 4615.18800 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:22:04 | PRICE UPDATE | XAUUSDm Bid: 4613.87500 Ask: 4614.15500 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:22:05 | PRICE UPDATE | XAUUSDm Bid: 4612.54100 Ask: 4612.93700 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:22:05 | PRICE UPDATE | XAUUSDm Bid: 4613.70500 Ask: 4614.10100 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:22:08 | PRICE UPDATE | XAUUSDm Bid: 4615.38500 Ask: 4615.78100 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:22:42 | PRICE UPDATE | XAUUSDm Bid: 4616.76000 Ask: 4617.06800 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:22:49 | PRICE UPDATE | XAUUSDm Bid: 4615.64300 Ask: 4615.95100 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:23:03 | PRICE UPDATE | XAUUSDm Bid: 4616.71700 Ask: 4617.02500 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:23:10 | PRICE UPDATE | XAUUSDm Bid: 4617.77900 Ask: 4618.05900 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:27:34 | PRICE UPDATE | XAUUSDm Bid: 4620.43000 Ask: 4620.73800 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:27:52 | PRICE UPDATE | XAUUSDm Bid: 4620.65800 Ask: 4620.96600 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:29:38 | PRICE UPDATE | XAUUSDm Bid: 4620.33000 Ask: 4620.63800 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:29:38 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 154ms
+2026-05-04 01:29:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 75ms
+2026-05-04 01:29:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 90ms
+2026-05-04 01:30:19 | ACTION | TrailSLTP #1552259343 | Latency: 129ms
+2026-05-04 01:31:00 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 288ms
+2026-05-04 01:31:05 | PRICE UPDATE | XAUUSDm Bid: 4621.37600 Ask: 4621.68400 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:31:28 | PRICE UPDATE | XAUUSDm Bid: 4622.39200 Ask: 4622.70000 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:32:00 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 78ms
+2026-05-04 01:32:04 | PRICE UPDATE | XAUUSDm Bid: 4621.28800 Ask: 4621.59600 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:32:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 76ms
+2026-05-04 01:33:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 69ms
+2026-05-04 01:34:07 | PRICE UPDATE | XAUUSDm Bid: 4622.32200 Ask: 4622.63000 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:34:22 | PRICE UPDATE | XAUUSDm Bid: 4623.43200 Ask: 4623.74000 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:34:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 91ms
+2026-05-04 01:35:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 90ms
+2026-05-04 01:36:15 | PRICE UPDATE | XAUUSDm Bid: 4624.53900 Ask: 4624.84700 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:36:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 75ms
+2026-05-04 01:36:59 | PRICE UPDATE | XAUUSDm Bid: 4623.39200 Ask: 4623.70000 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:37:26 | PRICE UPDATE | XAUUSDm Bid: 4624.51800 Ask: 4624.82600 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:37:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 78ms
+2026-05-04 01:38:04 | PRICE UPDATE | XAUUSDm Bid: 4625.54200 Ask: 4625.85000 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:38:54 | PRICE UPDATE | XAUUSDm Bid: 4626.54300 Ask: 4626.85100 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:38:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 92ms
+2026-05-04 01:39:07 | ACTION | TrailSLTP #1552286443 | Latency: 95ms
+2026-05-04 01:39:08 | PRICE UPDATE | XAUUSDm Bid: 4625.41900 Ask: 4625.72700 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:39:08 | ACTION | TrailSLTP #1552286443 | Latency: 71ms
+2026-05-04 01:39:59 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 77ms
+2026-05-04 01:40:08 | PRICE UPDATE | XAUUSDm Bid: 4626.50400 Ask: 4626.81200 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:40:53 | PRICE UPDATE | XAUUSDm Bid: 4627.59300 Ask: 4627.90100 | Broker Ping: 70ms | App-Terminal Speed: 0ms
+2026-05-04 01:41:00 | ACTION | ExecuteSellLimit XAUUSDm | Latency: 100ms

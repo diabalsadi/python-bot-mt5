@@ -201,7 +201,7 @@ def trail_sltp(
         step_points = max(trailing_step_points, step_points)
         step_points = min(trailing_step_points * 4, step_points)
 
-    stops_level = int(mt5.symbol_info_integer(symbol, mt5.SYMBOL_TRADE_STOPS_LEVEL))
+    stops_level = int(sym.trade_stops_level)
     safety_buf  = 20 * point
     min_dist    = stops_level * point + safety_buf
 
@@ -512,12 +512,24 @@ def check_us_session_exclusion(
 # Order Execution Helpers
 # ══════════════════════════════════════════════════════════════════════
 
+def _get_timeframe_seconds(timeframe: int) -> int:
+    mapping = {
+        mt5.TIMEFRAME_M1: 60, mt5.TIMEFRAME_M2: 120, mt5.TIMEFRAME_M3: 180,
+        mt5.TIMEFRAME_M4: 240, mt5.TIMEFRAME_M5: 300, mt5.TIMEFRAME_M6: 360,
+        mt5.TIMEFRAME_M10: 600, mt5.TIMEFRAME_M12: 720, mt5.TIMEFRAME_M15: 900,
+        mt5.TIMEFRAME_M20: 1200, mt5.TIMEFRAME_M30: 1800, mt5.TIMEFRAME_H1: 3600,
+        mt5.TIMEFRAME_H2: 7200, mt5.TIMEFRAME_H3: 10800, mt5.TIMEFRAME_H4: 14400,
+        mt5.TIMEFRAME_H6: 21600, mt5.TIMEFRAME_H8: 28800, mt5.TIMEFRAME_H12: 43200,
+        mt5.TIMEFRAME_D1: 86400, mt5.TIMEFRAME_W1: 604800, mt5.TIMEFRAME_MN1: 2592000,
+    }
+    return mapping.get(timeframe, 60)
+
 def _build_expiration(symbol: str, timeframe: int, expiration_hours: int) -> int:
     """Return Unix timestamp for order expiration."""
     current_bar_time = mt5.copy_rates_from_pos(symbol, timeframe, 0, 1)
     if current_bar_time is None:
         return 0
-    bar_seconds = mt5.period_seconds(timeframe)
+    bar_seconds = _get_timeframe_seconds(timeframe)
     return int(current_bar_time[0]["time"]) + expiration_hours * bar_seconds
 
 
@@ -540,7 +552,7 @@ def execute_buy_limit(
     sym     = mt5.symbol_info(symbol)
     point   = sym.point
     digits  = sym.digits
-    stops   = int(mt5.symbol_info_integer(symbol, mt5.SYMBOL_TRADE_STOPS_LEVEL))
+    stops   = int(sym.trade_stops_level)
 
     ask   = mt5.symbol_info_tick(symbol).ask
     entry = round(entry_level, digits)
@@ -604,7 +616,7 @@ def execute_sell_limit(
     sym     = mt5.symbol_info(symbol)
     point   = sym.point
     digits  = sym.digits
-    stops   = int(mt5.symbol_info_integer(symbol, mt5.SYMBOL_TRADE_STOPS_LEVEL))
+    stops   = int(sym.trade_stops_level)
 
     bid   = mt5.symbol_info_tick(symbol).bid
     entry = round(entry_level, digits)

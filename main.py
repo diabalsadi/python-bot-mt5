@@ -33,6 +33,7 @@ from actions.strategy import (
     trail_sltp,
 )
 from indicators.atr import check_high_volatility
+from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
 from mt5_tool.symbol import get_symbol, stream_ticks
 from tools.print import pretty_print
@@ -64,11 +65,11 @@ MIN_ORDER_DISTANCE_PTS = 500
 RESET_ORDERS_INTERVAL = 30  # minutes
 
 # Protection
-AVOID_HIGH_VOLATILITY = True
+AVOID_HIGH_VOLATILITY = False
 VOLATILITY_MULTIPLIER = 2.0
 MAX_LATENCY_MS = 2000
 ENABLE_LATENCY_CHECK = True
-USE_US_OPEN_PROTECTION = True
+USE_US_OPEN_PROTECTION = False
 US_OPEN_PROTECTION_HRS = 2
 US_START_HOUR = 15
 
@@ -81,7 +82,7 @@ total_bars = 0
 ml_train_counter = 0
 last_deletion_ts = 0.0
 last_tick_time_msc = 0
-
+last_logged_bid = 0.0
 
 # ──────────────────────────────────────────────────────────────────────
 # Helpers
@@ -104,7 +105,7 @@ def _bars_available() -> int:
 
 def on_tick() -> None:
     """Called on every price tick — mirrors MQL5 OnTick()."""
-    global total_bars, ml_train_counter, last_deletion_ts, last_tick_time_msc
+    global total_bars, ml_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid
 
     # Measure tick latency
     t0 = time.perf_counter()
@@ -114,12 +115,15 @@ def on_tick() -> None:
     if tick is not None and tick.time_msc != last_tick_time_msc:
         last_tick_time_msc = tick.time_msc
 
-        terminal_info = mt5.terminal_info()
-        broker_ping_ms = int(terminal_info.ping_last / 1000) if terminal_info else 0
+        if abs(tick.bid - last_logged_bid) >= 1.0:
+            last_logged_bid = tick.bid
 
-        logging.info(
-            f"PRICE UPDATE | {SYMBOL} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | Broker Ping: {broker_ping_ms}ms | App-Terminal Speed: {app_terminal_speed_ms}ms"
-        )
+            terminal_info = mt5.terminal_info()
+            broker_ping_ms = int(terminal_info.ping_last / 1000) if terminal_info else 0
+
+            logging.info(
+                f"PRICE UPDATE | {SYMBOL} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | Broker Ping: {broker_ping_ms}ms | App-Terminal Speed: {app_terminal_speed_ms}ms"
+            )
 
     # 1. US open protection (highest priority)
     if USE_US_OPEN_PROTECTION and check_us_session_exclusion(
@@ -225,6 +229,44 @@ def on_tick() -> None:
             MIN_ORDER_DISTANCE_PTS,
             model,
         )
+
+    # 6e. Place Fibonacci orders
+    fibo_levels = get_m30_fibo_levels(SYMBOL)
+    if fibo_levels:
+        is_bullish = fibo_levels.get("is_bullish", False)
+        # If prediction is positive and M30 bar was bullish (retracing down for support)
+        if prediction > 0 and is_bullish:
+            for level_name in ["pullback_50", "pullback_61"]:
+                if level_name in fibo_levels:
+                    execute_buy_limit(
+                        SYMBOL,
+                        TIMEFRAME,
+                        fibo_levels[level_name],
+                        SL_POINTS,
+                        ML_FEATURE_WINDOW,
+                        RSI_PERIOD,
+                        RISK_PERCENT / 2.0,  # Risk half on fibo entries
+                        EXPIRATION_HOURS,
+                        MIN_ORDER_DISTANCE_PTS,
+                        model,
+                    )
+
+        # If prediction is negative and M30 bar was bearish (retracing up for resistance)
+        elif prediction < 0 and not is_bullish:
+            for level_name in ["pullback_50", "pullback_61"]:
+                if level_name in fibo_levels:
+                    execute_sell_limit(
+                        SYMBOL,
+                        TIMEFRAME,
+                        fibo_levels[level_name],
+                        SL_POINTS,
+                        ML_FEATURE_WINDOW,
+                        RSI_PERIOD,
+                        RISK_PERCENT / 2.0,  # Risk half on fibo entries
+                        EXPIRATION_HOURS,
+                        MIN_ORDER_DISTANCE_PTS,
+                        model,
+                    )
 
     # 7. Trail SL/TP every tick
     trail_sltp(SYMBOL, TIMEFRAME, TRAILING_STEP_POINTS, SL_POINTS, ML_FEATURE_WINDOW)

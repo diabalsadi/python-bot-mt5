@@ -1,0 +1,2 @@
+python-dotenv
+MetaTrader5

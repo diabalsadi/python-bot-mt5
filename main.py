@@ -26,10 +26,12 @@ from actions.strategy import (
     cancel_stale_orders,
     check_latency,
     check_us_session_exclusion,
-    execute_buy_limit,
-    execute_sell_limit,
+    execute_buy_market,
+    execute_sell_market,
     get_market_session,
     get_ml_entry_levels,
+    get_quick_profit_levels,
+    get_15m_lookahead_confirmation,
     trail_sltp,
 )
 from indicators.atr import check_high_volatility
@@ -124,6 +126,13 @@ def on_tick() -> None:
             logging.info(
                 f"PRICE UPDATE | {SYMBOL} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | Broker Ping: {broker_ping_ms}ms | App-Terminal Speed: {app_terminal_speed_ms}ms"
             )
+            if model.is_trained:
+                print(
+                    f"🤖 ML Model Trained | "
+                    f"β0={model.beta0:.4f}  β1={model.beta1:.4f}  "
+                    f"β2={model.beta2:.4f}  β3={model.beta3:.4f}  β4={model.beta4:.4f}  "
+                    f"β5={model.beta5:.4f}  β6={model.beta6:.4f}"
+                )
 
     # 1. US open protection (highest priority)
     if USE_US_OPEN_PROTECTION and check_us_session_exclusion(
@@ -158,33 +167,23 @@ def on_tick() -> None:
         cancel_all_orders(SYMBOL)
         last_deletion_ts = now
 
-    # 6. New-bar logic
-    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 2)
-    if rates is None:
-        return
+    # 6a. Model retraining (every tick)
+    model.train(
+        SYMBOL,
+        TIMEFRAME,
+        ML_TRAINING_BARS,
+        ML_PREDICTION_HORIZON,
+        ML_FEATURE_WINDOW,
+        RSI_PERIOD,
+    )
 
-    bars = int(rates[0]["time"])  # unique per bar (timestamp of current bar)
-    if total_bars == bars:
-        # Same bar → only trail stops
-        trail_sltp(
-            SYMBOL, TIMEFRAME, TRAILING_STEP_POINTS, SL_POINTS, ML_FEATURE_WINDOW
-        )
-        return
-
-    total_bars = bars
-    ml_train_counter += 1
-
-    # 6a. Periodic model retraining
-    if ml_train_counter >= ML_RETRAIN_INTERVAL:
-        model.train(
-            SYMBOL,
-            TIMEFRAME,
-            ML_TRAINING_BARS,
-            ML_PREDICTION_HORIZON,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
-        )
-        ml_train_counter = 0
+    # 6a.5 Get 15-minute lookahead confirmation
+    target_15m, direction_15m = get_15m_lookahead_confirmation(
+        SYMBOL, TIMEFRAME, model, ML_FEATURE_WINDOW, RSI_PERIOD
+    )
+    print(
+        f"📊 15M Lookahead | Target: {target_15m:.5f} | Direction: {direction_15m}"
+    )
 
     # 6b. Get ML entry levels
     buy_level, sell_level = get_ml_entry_levels(
@@ -197,36 +196,50 @@ def on_tick() -> None:
         model,
     )
 
+    # 6b.5 Get quick-profit levels for tight TP (15m S/R based)
+    buy_tight_tp, buy_extended_tp = get_quick_profit_levels(
+        SYMBOL, TIMEFRAME, 1, model, ML_FEATURE_WINDOW, RSI_PERIOD
+    ) if buy_level > 0 else (-1.0, -1.0)
+
+    sell_tight_tp, sell_extended_tp = get_quick_profit_levels(
+        SYMBOL, TIMEFRAME, -1, model, ML_FEATURE_WINDOW, RSI_PERIOD
+    ) if sell_level > 0 else (-1.0, -1.0)
+
+    if buy_level > 0:
+        print(
+            f"💰 BUY Quick Profit | Tight TP: {buy_tight_tp:.5f} | Extended TP: {buy_extended_tp:.5f}"
+        )
+    if sell_level > 0:
+        print(
+            f"💰 SELL Quick Profit | Tight TP: {sell_tight_tp:.5f} | Extended TP: {sell_extended_tp:.5f}"
+        )
+
     # 6c. Cancel orders that contradict the current prediction
     prediction = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
+    predicted_price = tick.bid + prediction
+    print(f"ML Prediction: {prediction:+.5f} | Predicted Target Price: {predicted_price:.5f}")
     cancel_stale_orders(SYMBOL, prediction)
 
     # 6d. Place new orders
     if buy_level > 0:
-        execute_buy_limit(
+        execute_buy_market(
             SYMBOL,
             TIMEFRAME,
-            buy_level,
             SL_POINTS,
             ML_FEATURE_WINDOW,
             RSI_PERIOD,
             RISK_PERCENT,
-            EXPIRATION_HOURS,
-            MIN_ORDER_DISTANCE_PTS,
             model,
         )
 
     if sell_level > 0:
-        execute_sell_limit(
+        execute_sell_market(
             SYMBOL,
             TIMEFRAME,
-            sell_level,
             SL_POINTS,
             ML_FEATURE_WINDOW,
             RSI_PERIOD,
             RISK_PERCENT,
-            EXPIRATION_HOURS,
-            MIN_ORDER_DISTANCE_PTS,
             model,
         )
 
@@ -238,16 +251,13 @@ def on_tick() -> None:
         if prediction > 0 and is_bullish:
             for level_name in ["pullback_50", "pullback_61"]:
                 if level_name in fibo_levels:
-                    execute_buy_limit(
+                    execute_buy_market(
                         SYMBOL,
                         TIMEFRAME,
-                        fibo_levels[level_name],
                         SL_POINTS,
                         ML_FEATURE_WINDOW,
                         RSI_PERIOD,
                         RISK_PERCENT / 2.0,  # Risk half on fibo entries
-                        EXPIRATION_HOURS,
-                        MIN_ORDER_DISTANCE_PTS,
                         model,
                     )
 
@@ -255,16 +265,13 @@ def on_tick() -> None:
         elif prediction < 0 and not is_bullish:
             for level_name in ["pullback_50", "pullback_61"]:
                 if level_name in fibo_levels:
-                    execute_sell_limit(
+                    execute_sell_market(
                         SYMBOL,
                         TIMEFRAME,
-                        fibo_levels[level_name],
                         SL_POINTS,
                         ML_FEATURE_WINDOW,
                         RSI_PERIOD,
                         RISK_PERCENT / 2.0,  # Risk half on fibo entries
-                        EXPIRATION_HOURS,
-                        MIN_ORDER_DISTANCE_PTS,
                         model,
                     )
 

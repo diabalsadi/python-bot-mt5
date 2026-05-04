@@ -15,6 +15,7 @@ Covers:
   - Market-session detection (GetMarketSession)
   - US-open protection (CheckUSSessionExclusion)
   - Order execution (executeBuyLimit / executeSellLimit)
+  - Multi-timeframe quick profit (15m lookahead + small-timeframe S/R)
   - Utility: findHigh / findLow
 """
 
@@ -87,7 +88,7 @@ def get_ml_entry_levels(
     sell_level = -1.0
 
     count = trend_bars + 5
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, count)  # skip forming bar
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)  # include forming bar
     if rates is None or len(rates) == 0:
         return buy_level, sell_level
 
@@ -168,6 +169,30 @@ def get_ml_sltp(
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Position Management (Track all trades including manual ones)
+# ══════════════════════════════════════════════════════════════════════
+
+def get_symbol_positions(symbol: str) -> list:
+    """
+    Get all open positions for a specific symbol, including manual trades.
+    
+    Safely handles account with mixed EA and manual trades by filtering
+    by symbol instead of assuming fixed indices.
+    
+    Args:
+        symbol: Trading symbol
+    
+    Returns:
+        List of position objects for the symbol (may be empty)
+    """
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None or len(positions) == 0:
+        return []
+    
+    return list(positions)
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Trailing Stop + Trailing TP
 # ══════════════════════════════════════════════════════════════════════
 
@@ -182,31 +207,35 @@ def trail_sltp(
     Move SL (and TP) forward as the position gains profit.
     Step size is dynamic: proportional to current volatility but always at
     least `trailing_step_points`.
+    
+    Safely handles all positions including manual trades by iterating
+    through positions directly instead of using indices.
 
     MQL5 equivalent: TrailSLTP()
     """
-    total = mt5.positions_total()
-    if total == 0:
+    # Get all positions for this symbol (includes manual trades)
+    positions = get_symbol_positions(symbol)
+    if not positions:
         return
 
     sym   = mt5.symbol_info(symbol)
+    if sym is None:
+        return
+        
     point = sym.point
 
-    # Dynamic trailing step
+    # Dynamic trailing distance based on market volatility
     current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
-    if (current_vol * point) > 2.0:
-        step_points = trailing_step_points
-    else:
-        step_points = int(current_vol * 0.5)
-        step_points = max(trailing_step_points, step_points)
-        step_points = min(trailing_step_points * 4, step_points)
+    trail_dist_points = max(trailing_step_points * 1.5, current_vol * 1.5)
+    trail_dist_points = min(500, trail_dist_points)
+    trail_dist = trail_dist_points * point
 
     stops_level = int(sym.trade_stops_level)
     safety_buf  = 20 * point
     min_dist    = stops_level * point + safety_buf
 
-    for i in range(total):
-        pos = mt5.positions_get()[i]
+    # Iterate through actual positions instead of using indices
+    for pos in positions:
         if pos is None or pos.symbol != symbol:
             continue
 
@@ -214,8 +243,12 @@ def trail_sltp(
         sl    = pos.sl
         tp    = pos.tp
 
-        bid = mt5.symbol_info_tick(symbol).bid
-        ask = mt5.symbol_info_tick(symbol).ask
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            continue
+            
+        bid = tick.bid
+        ask = tick.ask
 
         if pos.type == mt5.POSITION_TYPE_BUY:
             price         = bid
@@ -224,17 +257,16 @@ def trail_sltp(
             price         = ask
             profit_points = (entry - price) / point
 
-        if profit_points < step_points:
+        # Only begin trailing if we have a minimum profit buffer
+        if profit_points < trailing_step_points:
             continue
 
-        steps = int(profit_points // step_points)
-
         if pos.type == mt5.POSITION_TYPE_BUY:
-            new_sl = entry + steps * step_points * point
-            new_tp = new_sl + sl_points * 3 * point
+            new_sl = price - trail_dist
+            new_tp = price + sl_points * 3 * point
         else:
-            new_sl = entry - steps * step_points * point
-            new_tp = new_sl - sl_points * 3 * point
+            new_sl = price + trail_dist
+            new_tp = price - sl_points * 3 * point
 
         digits = sym.digits
         new_sl = round(new_sl, digits)
@@ -533,36 +565,36 @@ def _build_expiration(symbol: str, timeframe: int, expiration_hours: int) -> int
     return int(current_bar_time[0]["time"]) + expiration_hours * bar_seconds
 
 
-def execute_buy_limit(
+def has_open_position(symbol: str, position_type: int) -> bool:
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        return False
+    for pos in positions:
+        if pos.type == position_type:
+            return True
+    return False
+
+def execute_buy_market(
     symbol: str,
     timeframe: int,
-    entry_level: float,
     sl_points_default: int,
     feature_window: int,
     rsi_period: int,
     risk_percent: float,
-    expiration_hours: int,
-    min_order_distance_points: int,
     model: LinearRegressionModel,
 ) -> None:
     """
-    Place a Buy Limit order at or below the current ask.
-    MQL5 equivalent: executeBuyLimit()
+    Execute a Market Buy order at current ask.
     """
     sym     = mt5.symbol_info(symbol)
     point   = sym.point
     digits  = sym.digits
-    stops   = int(sym.trade_stops_level)
+
+    if has_open_position(symbol, mt5.POSITION_TYPE_BUY):
+        return
 
     ask   = mt5.symbol_info_tick(symbol).ask
-    entry = round(entry_level, digits)
-
-    min_dist = stops * point
-    if ask - entry < min_dist:
-        entry = round(ask - min_dist - 2 * point, digits)
-
-    if has_order_near_price(symbol, entry, mt5.ORDER_TYPE_BUY_LIMIT, min_order_distance_points):
-        return
+    entry = ask
 
     sl_dist, tp_dist = get_ml_sltp(symbol, timeframe, sl_points_default,
                                     feature_window, rsi_period, model)
@@ -571,62 +603,53 @@ def execute_buy_limit(
 
     sl_pts  = int(sl_dist / point)
     lot     = calculate_lot_size(symbol, sl_pts, risk_percent)
-    expiry  = _build_expiration(symbol, timeframe, expiration_hours)
 
-    print(f"🟦 BUY LIMIT  → entry={entry:.5f}  SL={sl:.5f}  TP={tp:.5f}  lot={lot}")
+    print(f"🟦 BUY MARKET → entry={entry:.5f}  SL={sl:.5f}  TP={tp:.5f}  lot={lot}")
 
     request = {
-        "action":       mt5.TRADE_ACTION_PENDING,
+        "action":       mt5.TRADE_ACTION_DEAL,
         "symbol":       symbol,
         "volume":       lot,
-        "type":         mt5.ORDER_TYPE_BUY_LIMIT,
+        "type":         mt5.ORDER_TYPE_BUY,
         "price":        entry,
         "sl":           sl,
         "tp":           tp,
-        "type_time":    mt5.ORDER_TIME_SPECIFIED,
-        "expiration":   expiry,
-        "comment":      "ML buy limit",
+        "deviation":    20,
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+        "comment":      "ML buy market",
     }
     t0 = time.perf_counter()
     result = mt5.order_send(request)
     lat_ms = int((time.perf_counter() - t0) * 1000)
-    logging.info(f"ACTION | ExecuteBuyLimit {symbol} | Latency: {lat_ms}ms")
+    logging.info(f"ACTION | ExecuteBuyMarket {symbol} | Latency: {lat_ms}ms")
     
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         err = mt5.last_error() if result is None else result.comment
-        print(f"❌ BuyLimit failed: {err}")
+        print(f"❌ Buy Market failed: {err}")
 
 
-def execute_sell_limit(
+def execute_sell_market(
     symbol: str,
     timeframe: int,
-    entry_level: float,
     sl_points_default: int,
     feature_window: int,
     rsi_period: int,
     risk_percent: float,
-    expiration_hours: int,
-    min_order_distance_points: int,
     model: LinearRegressionModel,
 ) -> None:
     """
-    Place a Sell Limit order at or above the current bid.
-    MQL5 equivalent: executeSellLimit()
+    Execute a Market Sell order at current bid.
     """
     sym     = mt5.symbol_info(symbol)
     point   = sym.point
     digits  = sym.digits
-    stops   = int(sym.trade_stops_level)
+
+    if has_open_position(symbol, mt5.POSITION_TYPE_SELL):
+        return
 
     bid   = mt5.symbol_info_tick(symbol).bid
-    entry = round(entry_level, digits)
-
-    min_dist = stops * point
-    if entry - bid < min_dist:
-        entry = round(bid + min_dist + 2 * point, digits)
-
-    if has_order_near_price(symbol, entry, mt5.ORDER_TYPE_SELL_LIMIT, min_order_distance_points):
-        return
+    entry = bid
 
     sl_dist, tp_dist = get_ml_sltp(symbol, timeframe, sl_points_default,
                                     feature_window, rsi_period, model)
@@ -635,30 +658,30 @@ def execute_sell_limit(
 
     sl_pts = int(sl_dist / point)
     lot    = calculate_lot_size(symbol, sl_pts, risk_percent)
-    expiry = _build_expiration(symbol, timeframe, expiration_hours)
 
-    print(f"🟥 SELL LIMIT → entry={entry:.5f}  SL={sl:.5f}  TP={tp:.5f}  lot={lot}")
+    print(f"🟥 SELL MARKET → entry={entry:.5f}  SL={sl:.5f}  TP={tp:.5f}  lot={lot}")
 
     request = {
-        "action":       mt5.TRADE_ACTION_PENDING,
+        "action":       mt5.TRADE_ACTION_DEAL,
         "symbol":       symbol,
         "volume":       lot,
-        "type":         mt5.ORDER_TYPE_SELL_LIMIT,
+        "type":         mt5.ORDER_TYPE_SELL,
         "price":        entry,
         "sl":           sl,
         "tp":           tp,
-        "type_time":    mt5.ORDER_TIME_SPECIFIED,
-        "expiration":   expiry,
-        "comment":      "ML sell limit",
+        "deviation":    20,
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+        "comment":      "ML sell market",
     }
     t0 = time.perf_counter()
     result = mt5.order_send(request)
     lat_ms = int((time.perf_counter() - t0) * 1000)
-    logging.info(f"ACTION | ExecuteSellLimit {symbol} | Latency: {lat_ms}ms")
+    logging.info(f"ACTION | ExecuteSellMarket {symbol} | Latency: {lat_ms}ms")
     
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         err = mt5.last_error() if result is None else result.comment
-        print(f"❌ SellLimit failed: {err}")
+        print(f"❌ Sell Market failed: {err}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -675,3 +698,142 @@ def find_low(symbol: str, timeframe: int, bars_n: int) -> float:
     """Return the lowest low of the last `bars_n` bars. MQL5: findLow()"""
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, bars_n)
     return float(rates["low"].min()) if rates is not None and len(rates) > 0 else -1.0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Multi-Timeframe Quick Profit Targets (15m + S/R based)
+# ══════════════════════════════════════════════════════════════════════
+
+def get_quick_profit_levels(
+    symbol: str,
+    timeframe: int,
+    trend_direction: int,  # 1 = buy, -1 = sell
+    model: LinearRegressionModel,
+    feature_window: int,
+    rsi_period: int,
+) -> tuple[float, float]:
+    """
+    Calculate quick profit levels based on:
+      1. 15-minute lookahead ML prediction
+      2. 15-minute support/resistance zones
+      3. Current small-timeframe swing highs/lows
+
+    Returns (tight_tp, extended_tp) for scalping two-level profit targets.
+
+    Args:
+        symbol:           Trading symbol
+        timeframe:        Primary timeframe (e.g., M1)
+        trend_direction:  1 for buy, -1 for sell
+        model:            Trained ML model
+        feature_window:   Feature window size
+        rsi_period:       RSI period
+
+    Returns:
+        (tight_tp, extended_tp) — two profit target levels in price units
+    """
+    from indicators.support_resistance import identify_sr_levels
+
+    sym_info = mt5.symbol_info(symbol)
+    if sym_info is None:
+        return -1.0, -1.0
+
+    # Get current price
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return -1.0, -1.0
+
+    current_price = tick.bid if trend_direction == 1 else tick.ask
+
+    # 1. Get 15-minute lookahead prediction
+    lookahead_pred = model.predict_ahead(
+        symbol, timeframe, feature_window, rsi_period, horizon=15
+    )
+
+    # 2. Get S/R levels from 15m timeframe
+    support_levels, resistance_levels = identify_sr_levels(
+        symbol, mt5.TIMEFRAME_M15, lookback_bars=50
+    )
+
+    # 3. Find nearest S/R in direction of trade
+    tight_tp = -1.0
+    extended_tp = -1.0
+
+    if trend_direction == 1:  # BUY
+        # Look for resistances above current price
+        resistances_above = [r for r in resistance_levels if r > current_price]
+        if resistances_above:
+            # Tight TP = nearest resistance (quick scalp)
+            tight_tp = min(resistances_above)
+            # Extended TP = 2nd nearest or lookahead target
+            if len(resistances_above) > 1:
+                extended_tp = resistances_above[1]
+            else:
+                # Use lookahead if positive
+                extended_tp = (
+                    current_price + lookahead_pred
+                    if lookahead_pred > 0
+                    else tight_tp * 1.002
+                )
+
+    else:  # SELL (trend_direction == -1)
+        # Look for supports below current price
+        supports_below = [s for s in support_levels if s < current_price]
+        if supports_below:
+            # Tight TP = nearest support (quick scalp)
+            tight_tp = max(supports_below)
+            # Extended TP = 2nd nearest or lookahead target
+            if len(supports_below) > 1:
+                extended_tp = supports_below[-2]
+            else:
+                # Use lookahead if negative
+                extended_tp = (
+                    current_price + lookahead_pred
+                    if lookahead_pred < 0
+                    else tight_tp * 0.998
+                )
+
+    return tight_tp, extended_tp
+
+
+def get_15m_lookahead_confirmation(
+    symbol: str,
+    timeframe: int,
+    model: LinearRegressionModel,
+    feature_window: int,
+    rsi_period: int,
+) -> tuple[float, str]:
+    """
+    Get 15-minute lookahead price target and direction confirmation.
+
+    Returns (target_price, direction) where direction is "BUY", "SELL", or "NEUTRAL".
+    Useful for multi-timeframe confirmation before entering trades.
+
+    Args:
+        symbol:         Trading symbol
+        timeframe:      Primary timeframe
+        model:          Trained ML model
+        feature_window: Feature window size
+        rsi_period:     RSI period
+
+    Returns:
+        (target_price, direction_string)
+    """
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return tick.bid, "NEUTRAL"
+
+    current_price = tick.bid
+    prediction_15m = model.predict_ahead(
+        symbol, timeframe, feature_window, rsi_period, horizon=15
+    )
+
+    target_price = current_price + prediction_15m
+
+    if prediction_15m > 0:
+        direction = "BUY"
+    elif prediction_15m < 0:
+        direction = "SELL"
+    else:
+        direction = "NEUTRAL"
+
+    return target_price, direction

@@ -16,7 +16,9 @@ import MetaTrader5 as mt5
 import numpy as np
 
 
-def calculate_trend(symbol: str, timeframe: int, shift: int, feature_window: int) -> float:
+def calculate_trend(
+    symbol: str, timeframe: int, shift: int, feature_window: int
+) -> float:
     """
     Fit a straight line (OLS) through the closes of the last `feature_window`
     bars and return its slope in points per bar.
@@ -48,12 +50,12 @@ def calculate_trend(symbol: str, timeframe: int, shift: int, feature_window: int
     x = np.arange(n, dtype=float)
     y = np.array([closes_rev[shift + i] for i in range(n)])
 
-    sum_x   = x.sum()
-    sum_y   = y.sum()
-    sum_xy  = (x * y).sum()
-    sum_x2  = (x * x).sum()
+    sum_x = x.sum()
+    sum_y = y.sum()
+    sum_xy = (x * y).sum()
+    sum_x2 = (x * x).sum()
 
-    denom = n * sum_x2 - sum_x ** 2
+    denom = n * sum_x2 - sum_x**2
     if denom == 0:
         return 0.0
 
@@ -100,21 +102,29 @@ def get_technical_trend(
 
     closes = rates["close"][::-1]  # index 0 = current bar
 
-    current_close = closes[1]                  # last fully closed bar
-    old_close     = closes[1 + trend_bars]     # trend_bars before that
+    current_close = closes[0]  # current forming bar
+    old_close = closes[trend_bars]  # trend_bars before that
 
-    current_rsi = calculate_rsi(symbol, timeframe, 1, rsi_period)
-    current_ema = calculate_ema(symbol, timeframe, 1, ema_period)
+    current_rsi = calculate_rsi(symbol, timeframe, 0, rsi_period)
+    current_ema = calculate_ema(symbol, timeframe, 0, ema_period)
 
     if current_ema == 0.0:
         return 0
 
     # ── Bullish ────────────────────────────────────────────────────────
-    if current_close > current_ema and current_rsi < 30.0 and current_close > old_close:
+    if (
+        current_close > current_ema
+        and (current_rsi < 50.0 or current_rsi > 70.0)
+        and current_close > old_close
+    ):
         return 1
 
     # ── Bearish ────────────────────────────────────────────────────────
-    if current_close < current_ema and current_rsi > 70.0 and current_close < old_close:
+    if (
+        current_close < current_ema
+        and (current_rsi > 50.0 or current_rsi < 30.0)
+        and current_close < old_close
+    ):
         return -1
 
     return 0

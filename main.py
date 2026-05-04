@@ -32,6 +32,8 @@ from actions.strategy import (
     get_ml_entry_levels,
     get_quick_profit_levels,
     get_15m_lookahead_confirmation,
+    manage_scale_in,
+    manage_reversal_cut_loss,
     trail_sltp,
 )
 from indicators.atr import check_high_volatility
@@ -74,6 +76,14 @@ ENABLE_LATENCY_CHECK = True
 USE_US_OPEN_PROTECTION = False
 US_OPEN_PROTECTION_HRS = 2
 US_START_HOUR = 15
+
+# Scale-In / Cut-Loss strategy
+ENABLE_SCALE_IN = True  # Open new trades in same direction when losing but trend holds
+MAX_SCALE_IN_POSITIONS = (
+    3  # Max open positions per direction before scale-in is blocked
+)
+SCALE_IN_VOL_MULTIPLIER = 1.0  # Loss threshold = current volatility × this multiplier
+ENABLE_REVERSAL_CUT_LOSS = True  # Close all positions when ML flips direction
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -181,9 +191,7 @@ def on_tick() -> None:
     target_15m, direction_15m = get_15m_lookahead_confirmation(
         SYMBOL, TIMEFRAME, model, ML_FEATURE_WINDOW, RSI_PERIOD
     )
-    print(
-        f"📊 15M Lookahead | Target: {target_15m:.5f} | Direction: {direction_15m}"
-    )
+    print(f"📊 15M Lookahead | Target: {target_15m:.5f} | Direction: {direction_15m}")
 
     # 6b. Get ML entry levels
     buy_level, sell_level = get_ml_entry_levels(
@@ -197,13 +205,21 @@ def on_tick() -> None:
     )
 
     # 6b.5 Get quick-profit levels for tight TP (15m S/R based)
-    buy_tight_tp, buy_extended_tp = get_quick_profit_levels(
-        SYMBOL, TIMEFRAME, 1, model, ML_FEATURE_WINDOW, RSI_PERIOD
-    ) if buy_level > 0 else (-1.0, -1.0)
+    buy_tight_tp, buy_extended_tp = (
+        get_quick_profit_levels(
+            SYMBOL, TIMEFRAME, 1, model, ML_FEATURE_WINDOW, RSI_PERIOD
+        )
+        if buy_level > 0
+        else (-1.0, -1.0)
+    )
 
-    sell_tight_tp, sell_extended_tp = get_quick_profit_levels(
-        SYMBOL, TIMEFRAME, -1, model, ML_FEATURE_WINDOW, RSI_PERIOD
-    ) if sell_level > 0 else (-1.0, -1.0)
+    sell_tight_tp, sell_extended_tp = (
+        get_quick_profit_levels(
+            SYMBOL, TIMEFRAME, -1, model, ML_FEATURE_WINDOW, RSI_PERIOD
+        )
+        if sell_level > 0
+        else (-1.0, -1.0)
+    )
 
     if buy_level > 0:
         print(
@@ -217,8 +233,28 @@ def on_tick() -> None:
     # 6c. Cancel orders that contradict the current prediction
     prediction = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
     predicted_price = tick.bid + prediction
-    print(f"ML Prediction: {prediction:+.5f} | Predicted Target Price: {predicted_price:.5f}")
+    print(
+        f"ML Prediction: {prediction:+.5f} | Predicted Target Price: {predicted_price:.5f}"
+    )
     cancel_stale_orders(SYMBOL, prediction)
+
+    # 6c.1 Scale-In: add to position at better price if trend holds & trade is losing
+    if ENABLE_SCALE_IN:
+        manage_scale_in(
+            SYMBOL,
+            TIMEFRAME,
+            SL_POINTS,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+            RISK_PERCENT,
+            model,
+            MAX_SCALE_IN_POSITIONS,
+            SCALE_IN_VOL_MULTIPLIER,
+        )
+
+    # 6c.2 Reversal Cut-Loss: close all positions when ML confirms trend has flipped
+    if ENABLE_REVERSAL_CUT_LOSS:
+        manage_reversal_cut_loss(SYMBOL, prediction)
 
     # 6d. Place new orders
     if buy_level > 0:

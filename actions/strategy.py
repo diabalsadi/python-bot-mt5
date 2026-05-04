@@ -676,7 +676,6 @@ def execute_buy_market(
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Buy Market failed: {err}")
 
-
 def execute_sell_market(
     symbol: str,
     timeframe: int,
@@ -685,6 +684,7 @@ def execute_sell_market(
     rsi_period: int,
     risk_percent: float,
     model: LinearRegressionModel,
+    allow_multiple: bool = False,  # ✅ FIXED
 ) -> None:
     """
     Execute a Market Sell order at current bid.
@@ -693,7 +693,7 @@ def execute_sell_market(
     point = sym.point
     digits = sym.digits
 
-    if has_open_position(symbol, mt5.POSITION_TYPE_SELL):
+    if not allow_multiple and has_open_position(symbol, mt5.POSITION_TYPE_SELL):
         return
 
     bid = mt5.symbol_info_tick(symbol).bid
@@ -702,6 +702,7 @@ def execute_sell_market(
     sl_dist, tp_dist = get_ml_sltp(
         symbol, timeframe, sl_points_default, feature_window, rsi_period, model
     )
+
     sl = round(entry + sl_dist, digits)
     tp = round(entry - tp_dist, digits)
 
@@ -723,6 +724,7 @@ def execute_sell_market(
         "type_filling": mt5.ORDER_FILLING_IOC,
         "comment": "ML sell market",
     }
+
     t0 = time.perf_counter()
     result = mt5.order_send(request)
     lat_ms = int((time.perf_counter() - t0) * 1000)
@@ -731,8 +733,6 @@ def execute_sell_market(
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Sell Market failed: {err}")
-
-
 # ══════════════════════════════════════════════════════════════════════
 # Utility: Find Highest High / Lowest Low
 # ══════════════════════════════════════════════════════════════════════
@@ -888,3 +888,298 @@ def get_15m_lookahead_confirmation(
         direction = "NEUTRAL"
 
     return target_price, direction
+
+
+# ══════════════════════════════════════════════════════════════════════
+# S/R-Based Entry Strategy
+# ══════════════════════════════════════════════════════════════════════
+
+def execute_sr_entries(
+    symbol: str,
+    timeframe: int,
+    sl_points_default: int,
+    feature_window: int,
+    rsi_period: int,
+    risk_percent: float,
+    model,
+    confirmed_prediction: float,
+    proximity_points: int = 150,
+    sr_lookback_bars: int = 50,
+) -> None:
+    from indicators.support_resistance import identify_sr_levels
+
+    sym = mt5.symbol_info(symbol)
+    if sym is None:
+        return
+
+    point = sym.point
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return
+
+    bid = tick.bid
+    ask = tick.ask
+
+    # last closed candle
+    last_bar = mt5.copy_rates_from_pos(symbol, timeframe, 1, 2)
+    if last_bar is None or len(last_bar) < 2:
+        return
+
+    last_close = float(last_bar["close"][0])
+    prev_close = float(last_bar["close"][1])
+
+    # 🔥 MOMENTUM (simple but powerful)
+    price_velocity = last_close - prev_close
+    is_rising = price_velocity > 0
+    is_falling = price_velocity < 0
+
+    support_levels, resistance_levels = identify_sr_levels(
+        symbol, timeframe, sr_lookback_bars
+    )
+
+    proximity = proximity_points * point
+
+    # ── RESISTANCE ─────────────────────────────
+    for res in resistance_levels:
+
+        # SELL (mean reversion) → price rising into resistance
+        if (
+            is_rising
+            and ask <= res
+            and (res - ask) <= proximity
+            and confirmed_prediction < 0
+        ):
+            if not has_open_position(symbol, mt5.POSITION_TYPE_SELL):
+                print(f"📉 SELL @ resistance (momentum confirmed)")
+                execute_sell_market(
+                    symbol, timeframe, sl_points_default,
+                    feature_window, rsi_period, risk_percent, model
+                )
+            break
+
+        # BUY breakout
+        if last_close > res and confirmed_prediction > 0:
+            if not has_open_position(symbol, mt5.POSITION_TYPE_BUY):
+                print(f"🚀 BUY breakout resistance")
+                execute_buy_market(
+                    symbol, timeframe, sl_points_default,
+                    feature_window, rsi_period, risk_percent, model
+                )
+            break
+
+    # ── SUPPORT ───────────────────────────────
+    for sup in support_levels:
+
+        # BUY (mean reversion) → price falling into support
+        if (
+            is_falling
+            and bid >= sup
+            and (bid - sup) <= proximity
+            and confirmed_prediction > 0
+        ):
+            if not has_open_position(symbol, mt5.POSITION_TYPE_BUY):
+                print(f"📈 BUY @ support (momentum confirmed)")
+                execute_buy_market(
+                    symbol, timeframe, sl_points_default,
+                    feature_window, rsi_period, risk_percent, model
+                )
+            break
+
+        # SELL breakout
+        if last_close < sup and confirmed_prediction < 0:
+            if not has_open_position(symbol, mt5.POSITION_TYPE_SELL):
+                print(f"💥 SELL breakout support")
+                execute_sell_market(
+                    symbol, timeframe, sl_points_default,
+                    feature_window, rsi_period, risk_percent, model
+                )
+            break
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Scale-In Cooldown State
+# ══════════════════════════════════════════════════════════════════════
+import time as _time
+
+_scale_in_last_time: dict = {}   # symbol -> last scale-in unix timestamp
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Scale-In Management (averaging down with risk-based position cap)
+# ══════════════════════════════════════════════════════════════════════
+
+def manage_scale_in(
+    symbol: str,
+    timeframe: int,
+    sl_points_default: int,
+    feature_window: int,
+    rsi_period: int,
+    risk_percent: float,
+    model,
+    max_total_risk_percent: float,
+    volatility_multiplier: float,
+    cooldown_seconds: float = 60.0,
+) -> None:
+    """
+    Averaging-down (scale-in) strategy.
+
+    If a position is losing beyond a volatility-based threshold AND the ML
+    prediction still favours the same direction, we:
+      1. Move the original position's SL further out (give it room).
+      2. Open a new position at the current better price.
+
+    Position cap is derived from the risk budget so it automatically adjusts
+    as RISK_PERCENT changes:
+        max_positions = floor(max_total_risk_percent / risk_percent)
+
+    A cooldown prevents the function from firing more than once per
+    `cooldown_seconds` for the same symbol, stopping the runaway-open bug.
+    """
+    # ── Cooldown guard ────────────────────────────────────────────────
+    now = _time.time()
+    last = _scale_in_last_time.get(symbol, 0.0)
+    if now - last < cooldown_seconds:
+        return
+    # ─────────────────────────────────────────────────────────────────
+
+    positions = get_symbol_positions(symbol)
+    if not positions:
+        return
+
+    buy_positions  = [p for p in positions if p.type == mt5.POSITION_TYPE_BUY]
+    sell_positions = [p for p in positions if p.type == mt5.POSITION_TYPE_SELL]
+
+    sym = mt5.symbol_info(symbol)
+    if not sym:
+        return
+
+    point = sym.point
+    tick  = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return
+
+    # Dynamic cap from risk budget
+    max_positions = max(1, int(max_total_risk_percent / risk_percent))
+    print(
+        f"\u2696\ufe0f  Scale-In | cap={max_positions} "
+        f"({max_total_risk_percent:.0f}% / {risk_percent:.1f}% per trade)"
+    )
+
+    # Dynamic loss threshold from current volatility
+    current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
+    loss_threshold_pts = max(50.0, current_vol * volatility_multiplier)
+
+    prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
+
+    # ── BUY positions ─────────────────────────────────────────────────
+    if buy_positions and len(buy_positions) < max_positions and prediction > 0:
+        for pos in buy_positions:
+            profit_points = (tick.bid - pos.price_open) / point
+            if profit_points < -loss_threshold_pts:
+                print(
+                    f"\U0001f4c9 Scale-In BUY #{pos.ticket} "
+                    f"losing {-profit_points:.1f} pts — trend still UP"
+                )
+                # Widen SL of existing position
+                new_sl = round(tick.bid - sl_points_default * point * 1.5, sym.digits)
+                if pos.sl == 0 or new_sl < pos.sl:
+                    mt5.order_send({
+                        "action":   mt5.TRADE_ACTION_SLTP,
+                        "position": pos.ticket,
+                        "symbol":   symbol,
+                        "sl":       new_sl,
+                        "tp":       pos.tp,
+                    })
+                    print(f"   Moved SL of #{pos.ticket} -> {new_sl:.5f}")
+                # Open new buy at current better price
+                execute_buy_market(
+                    symbol, timeframe, sl_points_default, feature_window,
+                    rsi_period, risk_percent, model, allow_multiple=True,
+                )
+                _scale_in_last_time[symbol] = _time.time()
+                break   # one scale-in per cooldown cycle
+
+    # ── SELL positions ────────────────────────────────────────────────
+    if sell_positions and len(sell_positions) < max_positions and prediction < 0:
+        for pos in sell_positions:
+            profit_points = (pos.price_open - tick.ask) / point
+            if profit_points < -loss_threshold_pts:
+                print(
+                    f"\U0001f4c8 Scale-In SELL #{pos.ticket} "
+                    f"losing {-profit_points:.1f} pts — trend still DOWN"
+                )
+                new_sl = round(tick.ask + sl_points_default * point * 1.5, sym.digits)
+                if pos.sl == 0 or new_sl > pos.sl:
+                    mt5.order_send({
+                        "action":   mt5.TRADE_ACTION_SLTP,
+                        "position": pos.ticket,
+                        "symbol":   symbol,
+                        "sl":       new_sl,
+                        "tp":       pos.tp,
+                    })
+                    print(f"   Moved SL of #{pos.ticket} -> {new_sl:.5f}")
+                execute_sell_market(
+                    symbol, timeframe, sl_points_default, feature_window,
+                    rsi_period, risk_percent, model, allow_multiple=True,
+                )
+                _scale_in_last_time[symbol] = _time.time()
+                break
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Reversal Cut-Loss (close positions when trend confirmed to have flipped)
+# ══════════════════════════════════════════════════════════════════════
+
+def manage_reversal_cut_loss(symbol: str, prediction: float) -> None:
+    """
+    Close all open positions that are now against the confirmed ML direction.
+
+    - BUY positions closed when prediction turns negative (bearish).
+    - SELL positions closed when prediction turns positive (bullish).
+
+    Both the short-term (M1) and long-term (H1) models must agree on the
+    reversal before closing (call this with the combined signal from main.py).
+    """
+    positions = get_symbol_positions(symbol)
+    if not positions:
+        return
+
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return
+
+    for pos in positions:
+        if pos.type == mt5.POSITION_TYPE_BUY and prediction < 0:
+            print(
+                f"\U0001f6d1 Cut-Loss: closing BUY #{pos.ticket} "
+                f"— market shifted bearish (pred={prediction:.5f})"
+            )
+            mt5.order_send({
+                "action":       mt5.TRADE_ACTION_DEAL,
+                "position":     pos.ticket,
+                "symbol":       symbol,
+                "volume":       pos.volume,
+                "type":         mt5.ORDER_TYPE_SELL,
+                "price":        tick.bid,
+                "deviation":    20,
+                "type_time":    mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            })
+
+        elif pos.type == mt5.POSITION_TYPE_SELL and prediction > 0:
+            print(
+                f"\U0001f6d1 Cut-Loss: closing SELL #{pos.ticket} "
+                f"— market shifted bullish (pred={prediction:.5f})"
+            )
+            mt5.order_send({
+                "action":       mt5.TRADE_ACTION_DEAL,
+                "position":     pos.ticket,
+                "symbol":       symbol,
+                "volume":       pos.volume,
+                "type":         mt5.ORDER_TYPE_BUY,
+                "price":        tick.ask,
+                "deviation":    20,
+                "type_time":    mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            })

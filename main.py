@@ -28,6 +28,7 @@ from actions.strategy import (
     check_us_session_exclusion,
     execute_buy_market,
     execute_sell_market,
+    execute_sr_entries,
     get_market_session,
     get_ml_entry_levels,
     get_quick_profit_levels,
@@ -48,11 +49,16 @@ from tools.print import pretty_print
 SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSDm")
 TIMEFRAME = mt5.TIMEFRAME_M1
 
-# ML
-ML_TRAINING_BARS = 150
-ML_FEATURE_WINDOW = 12
-ML_RETRAIN_INTERVAL = 10  # bars between retrains
+# ML — short-term model (M1, last 150 bars for fast adaptation)
+ML_TRAINING_BARS      = 150
+ML_FEATURE_WINDOW     = 12
+ML_RETRAIN_INTERVAL   = 10    # bars between retrains
 ML_PREDICTION_HORIZON = 15
+
+# ML — long-term trend model (H1, ~3 months = 2160 bars)
+LONG_TIMEFRAME        = mt5.TIMEFRAME_H1
+LONG_TRAINING_BARS    = 2160  # ~3 months of H1 candles
+LONG_RETRAIN_INTERVAL = 60    # retrain long model every 60 short ticks
 
 # Indicators
 RSI_PERIOD = 14
@@ -78,20 +84,26 @@ US_OPEN_PROTECTION_HRS = 2
 US_START_HOUR = 15
 
 # Scale-In / Cut-Loss strategy
-ENABLE_SCALE_IN = True  # Open new trades in same direction when losing but trend holds
-MAX_SCALE_IN_POSITIONS = (
-    3  # Max open positions per direction before scale-in is blocked
-)
-SCALE_IN_VOL_MULTIPLIER = 1.0  # Loss threshold = current volatility × this multiplier
-ENABLE_REVERSAL_CUT_LOSS = True  # Close all positions when ML flips direction
+ENABLE_SCALE_IN              = True   # Average-down when trade loses but trend holds
+MAX_TOTAL_SCALE_RISK_PERCENT = 30.0   # Total risk budget; cap = this / RISK_PERCENT
+SCALE_IN_VOL_MULTIPLIER      = 1.0    # Loss threshold = volatility × this value
+SCALE_IN_COOLDOWN_SECS       = 60.0   # Min seconds between scale-in trades per symbol
+ENABLE_REVERSAL_CUT_LOSS     = True   # Close positions when BOTH models confirm reversal
+
+# S/R Entry strategy
+ENABLE_SR_ENTRIES    = True  # Trade bounces + breakouts from S/R levels
+SR_PROXIMITY_POINTS  = 150   # Points from level to trigger mean-reversion entry
+SR_LOOKBACK_BARS     = 50    # Bars used to detect S/R levels
 
 
 # ──────────────────────────────────────────────────────────────────────
 # State
 # ──────────────────────────────────────────────────────────────────────
-model = LinearRegressionModel()
+model        = LinearRegressionModel()   # short-term M1 model
+long_model   = LinearRegressionModel()   # long-term H1 model (3 months)
 total_bars = 0
 ml_train_counter = 0
+long_train_counter = 0
 last_deletion_ts = 0.0
 last_tick_time_msc = 0
 last_logged_bid = 0.0
@@ -117,8 +129,8 @@ def _bars_available() -> int:
 
 def on_tick() -> None:
     """Called on every price tick — mirrors MQL5 OnTick()."""
-    global total_bars, ml_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid
-
+    global total_bars, ml_train_counter, long_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid
+    
     # Measure tick latency
     t0 = time.perf_counter()
     tick = mt5.symbol_info_tick(SYMBOL)
@@ -177,15 +189,20 @@ def on_tick() -> None:
         cancel_all_orders(SYMBOL)
         last_deletion_ts = now
 
-    # 6a. Model retraining (every tick)
+    # 6a. Short-term model retraining (M1, every tick)
     model.train(
-        SYMBOL,
-        TIMEFRAME,
-        ML_TRAINING_BARS,
-        ML_PREDICTION_HORIZON,
-        ML_FEATURE_WINDOW,
-        RSI_PERIOD,
+        SYMBOL, TIMEFRAME, ML_TRAINING_BARS,
+        ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD,
     )
+
+    # 6a.1 Long-term trend model retraining (H1, ~3 months, less frequent)
+    long_train_counter += 1
+    if long_train_counter >= LONG_RETRAIN_INTERVAL or not long_model.is_trained:
+        long_model.train(
+            SYMBOL, LONG_TIMEFRAME, LONG_TRAINING_BARS,
+            ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD,
+        )
+        long_train_counter = 0
 
     # 6a.5 Get 15-minute lookahead confirmation
     target_15m, direction_15m = get_15m_lookahead_confirmation(
@@ -230,31 +247,39 @@ def on_tick() -> None:
             f"💰 SELL Quick Profit | Tight TP: {sell_tight_tp:.5f} | Extended TP: {sell_extended_tp:.5f}"
         )
 
-    # 6c. Cancel orders that contradict the current prediction
-    prediction = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
-    predicted_price = tick.bid + prediction
+    # 6c. Predictions: short-term (M1) + long-term (H1) combined signal
+    prediction      = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
+    long_prediction = long_model.predict(SYMBOL, LONG_TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
+    # Both models must agree on direction; otherwise signal is neutral
+    same_direction       = (prediction > 0 and long_prediction > 0) or (prediction < 0 and long_prediction < 0)
+    confirmed_prediction = prediction if same_direction else 0.0
+    predicted_price      = tick.bid + prediction
     print(
-        f"ML Prediction: {prediction:+.5f} | Predicted Target Price: {predicted_price:.5f}"
+        f"ML Short: {prediction:+.5f} | Long: {long_prediction:+.5f} | "
+        f"Confirmed: {confirmed_prediction:+.5f} | Target: {predicted_price:.5f}"
     )
-    cancel_stale_orders(SYMBOL, prediction)
+    cancel_stale_orders(SYMBOL, confirmed_prediction)
 
     # 6c.1 Scale-In: add to position at better price if trend holds & trade is losing
     if ENABLE_SCALE_IN:
         manage_scale_in(
-            SYMBOL,
-            TIMEFRAME,
-            SL_POINTS,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
-            RISK_PERCENT,
-            model,
-            MAX_SCALE_IN_POSITIONS,
-            SCALE_IN_VOL_MULTIPLIER,
+            SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD,
+            RISK_PERCENT, model, MAX_TOTAL_SCALE_RISK_PERCENT,
+            SCALE_IN_VOL_MULTIPLIER, SCALE_IN_COOLDOWN_SECS,
         )
 
     # 6c.2 Reversal Cut-Loss: close all positions when ML confirms trend has flipped
     if ENABLE_REVERSAL_CUT_LOSS:
-        manage_reversal_cut_loss(SYMBOL, prediction)
+        # Only cut losses when BOTH models confirm the reversal
+        manage_reversal_cut_loss(SYMBOL, confirmed_prediction)
+
+    # 6c.3 S/R Entries: sell at resistance, buy at support (+ breakouts)
+    if ENABLE_SR_ENTRIES:
+        execute_sr_entries(
+            SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD,
+            RISK_PERCENT, model, confirmed_prediction,
+            SR_PROXIMITY_POINTS, SR_LOOKBACK_BARS,
+        )
 
     # 6d. Place new orders
     if buy_level > 0:

@@ -106,6 +106,7 @@ ml_train_counter = 0
 long_train_counter = 0
 last_deletion_ts = 0.0
 last_tick_time_msc = 0
+last_bar_time = 0
 last_logged_bid = 0.0
 
 # ──────────────────────────────────────────────────────────────────────
@@ -129,7 +130,7 @@ def _bars_available() -> int:
 
 def on_tick() -> None:
     """Called on every price tick — mirrors MQL5 OnTick()."""
-    global total_bars, ml_train_counter, long_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid
+    global total_bars, ml_train_counter, long_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid, last_bar_time
     
     # Measure tick latency
     t0 = time.perf_counter()
@@ -189,11 +190,16 @@ def on_tick() -> None:
         cancel_all_orders(SYMBOL)
         last_deletion_ts = now
 
-    # 6a. Short-term model retraining (M1, every tick)
-    model.train(
-        SYMBOL, TIMEFRAME, ML_TRAINING_BARS,
-        ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD,
-    )
+    # 6a. Short-term model retraining (M1, only on NEW BAR to save CPU)
+    current_rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
+    if current_rates is not None:
+        this_bar_time = int(current_rates[0]["time"])
+        if this_bar_time != last_bar_time or not model.is_trained:
+            model.train(
+                SYMBOL, TIMEFRAME, ML_TRAINING_BARS,
+                ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD,
+            )
+            last_bar_time = this_bar_time
 
     # 6a.1 Long-term trend model retraining (H1, ~3 months, less frequent)
     long_train_counter += 1

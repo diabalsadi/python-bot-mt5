@@ -288,7 +288,7 @@ def trail_sltp(
         if not improve_sl:
             continue
 
-        if abs(new_sl - sl) < 0.5 * point:
+        if abs(new_sl - sl) < 10 * point:
             continue
 
         if abs(new_sl - price) < min_dist or abs(new_tp - price) < min_dist:

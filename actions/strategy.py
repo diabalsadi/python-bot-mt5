@@ -73,6 +73,8 @@ def get_ml_entry_levels(
     rsi_period: int,
     ema_period: int,
     model: LinearRegressionModel,
+    prediction: float,
+    verbose: bool = True,
 ) -> tuple[float, float]:
     """
     Return (buy_level, sell_level) based on technical trend + ML confirmation.
@@ -84,7 +86,7 @@ def get_ml_entry_levels(
     MQL5 equivalent: GetMLEntryLevels()
     """
     trend = get_technical_trend(symbol, timeframe, trend_bars, ema_period, rsi_period)
-    prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
+    # prediction is now passed as an argument to ensure synchronization
 
     buy_level = -1.0
     sell_level = -1.0
@@ -99,15 +101,17 @@ def get_ml_entry_levels(
 
     if trend == 1 and prediction > 0:
         buy_level = float(lows.min())
-        print(
-            f"📈 TREND BUY  | Low[{trend_bars}]={buy_level:.5f}  pred={prediction:.5f}"
-        )
+        if verbose:
+            print(
+                f"📈 TREND BUY  | Low[{trend_bars}]={buy_level:.5f}  pred={prediction:.5f}"
+            )
 
     elif trend == -1 and prediction < 0:
         sell_level = float(highs.max())
-        print(
-            f"📉 TREND SELL | High[{trend_bars}]={sell_level:.5f}  pred={prediction:.5f}"
-        )
+        if verbose:
+            print(
+                f"📉 TREND SELL | High[{trend_bars}]={sell_level:.5f}  pred={prediction:.5f}"
+            )
 
     return buy_level, sell_level
 
@@ -232,15 +236,17 @@ def trail_sltp(
         return
 
     point = sym.point
+    digits = sym.digits
 
-    # Dynamic trailing distance based on market volatility
+    # Dynamic trailing distance - wider and more robust
     current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
-    trail_dist_points = max(trailing_step_points * 1.5, current_vol * 1.5)
-    trail_dist_points = min(500, trail_dist_points)
+    # Give the trade 2.5x volatility or at least the initial SL distance to breathe
+    trail_dist_points = max(trailing_step_points * 3.0, current_vol * 2.5)
+    # REMOVED: hard 500 cap which was choking the trades
     trail_dist = trail_dist_points * point
 
     stops_level = int(sym.trade_stops_level)
-    safety_buf = 20 * point
+    safety_buf = 30 * point  # Slightly larger safety buffer
     min_dist = stops_level * point + safety_buf
 
     # Iterate through actual positions instead of using indices
@@ -266,30 +272,44 @@ def trail_sltp(
             price = ask
             profit_points = (entry - price) / point
 
-        # Only begin trailing if we have a minimum profit buffer
-        if profit_points < trailing_step_points:
-            continue
-
-        if pos.type == mt5.POSITION_TYPE_BUY:
-            new_sl = price - trail_dist
-            new_tp = price + sl_points * 3 * point
+        # 1. Break-Even Phase (Protect capital)
+        # Move to entry + safety when profit reaches 2x the step
+        is_breakeven_reached = profit_points >= trailing_step_points * 2
+        is_already_at_be = (pos.type == mt5.POSITION_TYPE_BUY and sl >= entry + safety_buf) or \
+                           (pos.type == mt5.POSITION_TYPE_SELL and sl <= entry - safety_buf)
+        
+        if is_breakeven_reached and not is_already_at_be:
+            new_sl = round(entry + safety_buf if pos.type == mt5.POSITION_TYPE_BUY else entry - safety_buf, digits)
+            print(f"🛡️ Break-Even activated for #{pos.ticket} (Profit: {profit_points:.1f}pts)")
+        
+        # 2. Active Trailing Phase (Lock in gains)
+        # Start trailing once profit reaches 4x the step
+        elif profit_points >= trailing_step_points * 4:
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                new_sl = price - trail_dist
+            else:
+                new_sl = price + trail_dist
+            
+            new_sl = round(new_sl, digits)
+            
+            # Only move SL in profitable direction
+            improve_sl = (pos.type == mt5.POSITION_TYPE_BUY and new_sl > sl) or (
+                pos.type == mt5.POSITION_TYPE_SELL and new_sl < sl
+            )
+            if not improve_sl:
+                continue
+                
+            if abs(new_sl - sl) < trailing_step_points * point:
+                continue
         else:
-            new_sl = price + trail_dist
-            new_tp = price - sl_points * 3 * point
-
-        digits = sym.digits
-        new_sl = round(new_sl, digits)
-        new_tp = round(new_tp, digits)
-
-        # Only move SL in profitable direction
-        improve_sl = (pos.type == mt5.POSITION_TYPE_BUY and new_sl > sl) or (
-            pos.type == mt5.POSITION_TYPE_SELL and new_sl < sl
-        )
-        if not improve_sl:
+            # Not in any phase yet
             continue
 
-        if abs(new_sl - sl) < 10 * point:
-            continue
+        # Shared TP logic
+        if pos.type == mt5.POSITION_TYPE_BUY:
+            new_tp = round(price + sl_points * 3 * point, digits)
+        else:
+            new_tp = round(price - sl_points * 3 * point, digits)
 
         if abs(new_sl - price) < min_dist or abs(new_tp - price) < min_dist:
             continue
@@ -307,7 +327,11 @@ def trail_sltp(
         logging.info(f"ACTION | TrailSLTP #{pos.ticket} | Latency: {lat_ms}ms")
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             err = mt5.last_error() if result is None else result.comment
-            print(f"⚠️  TrailSLTP failed on #{pos.ticket}: {err}")
+            print(
+                f"⚠️  TrailSLTP failed on #{pos.ticket}: {err} | "
+                f"Price: {price:.5f} | Proposed SL: {new_sl:.5f} TP: {new_tp:.5f} | "
+                f"Step: {trailing_step_points}"
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -875,9 +899,14 @@ def get_15m_lookahead_confirmation(
     """
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        return tick.bid, "NEUTRAL"
-
-    current_price = tick.bid
+        # Fallback to last known rates if tick fails
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, 1)
+        if rates is not None and len(rates) > 0:
+            current_price = rates[0]["close"]
+        else:
+            return 0.0, "NEUTRAL"
+    else:
+        current_price = tick.bid
     prediction_15m = model.predict_ahead(
         symbol, timeframe, feature_window, rsi_period, horizon=15
     )
@@ -1174,7 +1203,9 @@ def manage_scale_in(
 # ══════════════════════════════════════════════════════════════════════
 
 
-def manage_reversal_cut_loss(symbol: str, prediction: float) -> None:
+def manage_reversal_cut_loss(
+    symbol: str, prediction: float, loss_threshold_pct: float = 0.7
+) -> None:
     """
     Close all open positions that are now against the confirmed ML direction.
 
@@ -1193,11 +1224,22 @@ def manage_reversal_cut_loss(symbol: str, prediction: float) -> None:
         return
 
     for pos in positions:
+        # Calculate loss as percentage of initial SL
+        sl_dist = abs(pos.price_open - pos.sl) if pos.sl > 0 else 0
+        current_loss = 0.0
+        if pos.type == mt5.POSITION_TYPE_BUY:
+            current_loss = pos.price_open - tick.bid
+        else:
+            current_loss = tick.ask - pos.price_open
+
+        loss_pct = (current_loss / sl_dist) if sl_dist > 0 else 1.0
+
         if pos.type == mt5.POSITION_TYPE_BUY and prediction < 0:
-            print(
-                f"\U0001f6d1 Cut-Loss: closing BUY #{pos.ticket} "
-                f"— market shifted bearish (pred={prediction:.5f})"
-            )
+            if loss_pct >= loss_threshold_pct:
+                print(
+                    f"\U0001f6d1 Cut-Loss: closing BUY #{pos.ticket} "
+                    f"— market shifted bearish (pred={prediction:.5f}) & loss={loss_pct:.1%}"
+                )
             mt5.order_send(
                 {
                     "action": mt5.TRADE_ACTION_DEAL,
@@ -1213,10 +1255,11 @@ def manage_reversal_cut_loss(symbol: str, prediction: float) -> None:
             )
 
         elif pos.type == mt5.POSITION_TYPE_SELL and prediction > 0:
-            print(
-                f"\U0001f6d1 Cut-Loss: closing SELL #{pos.ticket} "
-                f"— market shifted bullish (pred={prediction:.5f})"
-            )
+            if loss_pct >= loss_threshold_pct:
+                print(
+                    f"\U0001f6d1 Cut-Loss: closing SELL #{pos.ticket} "
+                    f"— market shifted bullish (pred={prediction:.5f}) & loss={loss_pct:.1%}"
+                )
             mt5.order_send(
                 {
                     "action": mt5.TRADE_ACTION_DEAL,
@@ -1230,3 +1273,51 @@ def manage_reversal_cut_loss(symbol: str, prediction: float) -> None:
                     "type_filling": mt5.ORDER_FILLING_IOC,
                 }
             )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Market Status & Dynamic Trailing Utils
+# ══════════════════════════════════════════════════════════════════════
+
+
+def check_symbol_trading_status(symbol: str) -> tuple[bool, str]:
+    """
+    Check if the symbol is currently tradeable.
+    Returns (is_tradeable, status_message)
+    """
+    sym = mt5.symbol_info(symbol)
+    if sym is None:
+        return False, "SYMBOL NOT FOUND"
+
+    if sym.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+        return False, "DISABLED"
+    elif sym.trade_mode == mt5.SYMBOL_TRADE_MODE_CLOSEONLY:
+        return False, "CLOSE-ONLY"
+    elif sym.trade_mode == mt5.SYMBOL_TRADE_MODE_LONGONLY:
+        return True, "LONG-ONLY"
+    elif sym.trade_mode == mt5.SYMBOL_TRADE_MODE_SHORTONLY:
+        return True, "SHORT-ONLY"
+
+    return True, "FULL"
+
+
+def get_dynamic_trailing_step(symbol: str, timeframe: int, feature_window: int) -> int:
+    """
+    Calculate dynamic trailing step based on volatility.
+    Range [10, 50]. High Vol -> 10, Low Vol -> 50.
+    """
+    cur_vol = calculate_volatility(symbol, timeframe, 0, feature_window)
+    avg_vol = calculate_volatility(symbol, timeframe, 1, 50)  # 50-bar rolling average
+
+    if avg_vol <= 0:
+        return 10  # Default to conservative/tight if no data
+
+    ratio = cur_vol / avg_vol
+
+    # Linear interpolation:
+    # ratio 2.0 -> step 10
+    # ratio 0.5 -> step 50
+    # Formula: step = 50 - (ratio - 0.5) * (40 / 1.5)
+    step = 50 - (ratio - 0.5) * (40.0 / 1.5)
+
+    return max(10, min(50, int(step)))

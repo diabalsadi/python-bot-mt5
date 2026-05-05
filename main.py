@@ -36,6 +36,8 @@ from actions.strategy import (
     manage_scale_in,
     manage_reversal_cut_loss,
     trail_sltp,
+    check_symbol_trading_status,
+    get_dynamic_trailing_step,
 )
 from indicators.atr import check_high_volatility
 from indicators.fibonacci import get_m30_fibo_levels
@@ -50,15 +52,15 @@ SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSDm")
 TIMEFRAME = mt5.TIMEFRAME_M1
 
 # ML — short-term model (M1, last 150 bars for fast adaptation)
-ML_TRAINING_BARS      = 150
-ML_FEATURE_WINDOW     = 12
-ML_RETRAIN_INTERVAL   = 10    # bars between retrains
+ML_TRAINING_BARS = 150
+ML_FEATURE_WINDOW = 12
+ML_RETRAIN_INTERVAL = 10  # bars between retrains
 ML_PREDICTION_HORIZON = 15
 
 # ML — long-term trend model (H1, ~3 months = 2160 bars)
-LONG_TIMEFRAME        = mt5.TIMEFRAME_H1
-LONG_TRAINING_BARS    = 2160  # ~3 months of H1 candles
-LONG_RETRAIN_INTERVAL = 60    # retrain long model every 60 short ticks
+LONG_TIMEFRAME = mt5.TIMEFRAME_H1
+LONG_TRAINING_BARS = 2160  # ~3 months of H1 candles
+LONG_RETRAIN_INTERVAL = 60  # retrain long model every 60 short ticks
 
 # Indicators
 RSI_PERIOD = 14
@@ -69,7 +71,7 @@ TREND_BARS = 5
 # Risk / order management
 SL_POINTS = 2000
 RISK_PERCENT = 10.0
-TRAILING_STEP_POINTS = 100
+TRAILING_STEP_POINTS = 50
 EXPIRATION_HOURS = 50
 MIN_ORDER_DISTANCE_PTS = 500
 RESET_ORDERS_INTERVAL = 30  # minutes
@@ -84,23 +86,23 @@ US_OPEN_PROTECTION_HRS = 2
 US_START_HOUR = 15
 
 # Scale-In / Cut-Loss strategy
-ENABLE_SCALE_IN              = True   # Average-down when trade loses but trend holds
-MAX_TOTAL_SCALE_RISK_PERCENT = 30.0   # Total risk budget; cap = this / RISK_PERCENT
-SCALE_IN_VOL_MULTIPLIER      = 1.0    # Loss threshold = volatility × this value
-SCALE_IN_COOLDOWN_SECS       = 60.0   # Min seconds between scale-in trades per symbol
-ENABLE_REVERSAL_CUT_LOSS     = True   # Close positions when BOTH models confirm reversal
+ENABLE_SCALE_IN = True  # Average-down when trade loses but trend holds
+MAX_TOTAL_SCALE_RISK_PERCENT = 30.0  # Total risk budget; cap = this / RISK_PERCENT
+SCALE_IN_VOL_MULTIPLIER = 1.0  # Loss threshold = volatility × this value
+SCALE_IN_COOLDOWN_SECS = 60.0  # Min seconds between scale-in trades per symbol
+ENABLE_REVERSAL_CUT_LOSS = True  # Close positions when BOTH models confirm reversal
 
 # S/R Entry strategy
-ENABLE_SR_ENTRIES    = True  # Trade bounces + breakouts from S/R levels
-SR_PROXIMITY_POINTS  = 150   # Points from level to trigger mean-reversion entry
-SR_LOOKBACK_BARS     = 50    # Bars used to detect S/R levels
+ENABLE_SR_ENTRIES = True  # Trade bounces + breakouts from S/R levels
+SR_PROXIMITY_POINTS = 150  # Points from level to trigger mean-reversion entry
+SR_LOOKBACK_BARS = 50  # Bars used to detect S/R levels
 
 
 # ──────────────────────────────────────────────────────────────────────
 # State
 # ──────────────────────────────────────────────────────────────────────
-model        = LinearRegressionModel()   # short-term M1 model
-long_model   = LinearRegressionModel()   # long-term H1 model (3 months)
+model = LinearRegressionModel()  # short-term M1 model
+long_model = LinearRegressionModel()  # long-term H1 model (3 months)
 total_bars = 0
 ml_train_counter = 0
 long_train_counter = 0
@@ -131,7 +133,7 @@ def _bars_available() -> int:
 def on_tick() -> None:
     """Called on every price tick — mirrors MQL5 OnTick()."""
     global total_bars, ml_train_counter, long_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid, last_bar_time
-    
+
     # Measure tick latency
     t0 = time.perf_counter()
     tick = mt5.symbol_info_tick(SYMBOL)
@@ -140,6 +142,18 @@ def on_tick() -> None:
     if tick is not None and tick.time_msc != last_tick_time_msc:
         last_tick_time_msc = tick.time_msc
 
+        # 0. Market Status Guard
+        is_open, status_msg = check_symbol_trading_status(SYMBOL)
+        if not is_open:
+            # Log once every 30 seconds to avoid spam
+            now = time.time()
+            if not hasattr(on_tick, "_last_status_log"):
+                on_tick._last_status_log = 0
+            if now - on_tick._last_status_log > 30:
+                print(f"⚠️  PAUSED (Market Status: {status_msg})")
+                on_tick._last_status_log = now
+            return
+
         if abs(tick.bid - last_logged_bid) >= 1.0:
             last_logged_bid = tick.bid
 
@@ -147,15 +161,22 @@ def on_tick() -> None:
             broker_ping_ms = int(terminal_info.ping_last / 1000) if terminal_info else 0
 
             logging.info(
-                f"PRICE UPDATE | {SYMBOL} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | Broker Ping: {broker_ping_ms}ms | App-Terminal Speed: {app_terminal_speed_ms}ms"
+                f"PRICE UPDATE | {SYMBOL} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | "
+                f"Step: {TRAILING_STEP_POINTS} | Broker: {broker_ping_ms}ms | App: {app_terminal_speed_ms}ms"
             )
             if model.is_trained:
-                print(
-                    f"🤖 ML Model Trained | "
-                    f"β0={model.beta0:.4f}  β1={model.beta1:.4f}  "
-                    f"β2={model.beta2:.4f}  β3={model.beta3:.4f}  β4={model.beta4:.4f}  "
-                    f"β5={model.beta5:.4f}  β6={model.beta6:.4f}"
-                )
+                # Only print weights once per training cycle
+                if (
+                    not hasattr(on_tick, "_last_model_time")
+                    or on_tick._last_model_time != last_bar_time
+                ):
+                    print(
+                        f"🤖 ML Model Updated | "
+                        f"β0={model.beta0:.4f}  β1={model.beta1:.4f}  "
+                        f"β2={model.beta2:.4f}  β3={model.beta3:.4f}  β4={model.beta4:.4f}  "
+                        f"β5={model.beta5:.4f}  β6={model.beta6:.4f}"
+                    )
+                    on_tick._last_model_time = last_bar_time
 
     # 1. US open protection (highest priority)
     if USE_US_OPEN_PROTECTION and check_us_session_exclusion(
@@ -196,8 +217,12 @@ def on_tick() -> None:
         this_bar_time = int(current_rates[0]["time"])
         if this_bar_time != last_bar_time or not model.is_trained:
             model.train(
-                SYMBOL, TIMEFRAME, ML_TRAINING_BARS,
-                ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD,
+                SYMBOL,
+                TIMEFRAME,
+                ML_TRAINING_BARS,
+                ML_PREDICTION_HORIZON,
+                ML_FEATURE_WINDOW,
+                RSI_PERIOD,
             )
             last_bar_time = this_bar_time
 
@@ -205,18 +230,51 @@ def on_tick() -> None:
     long_train_counter += 1
     if long_train_counter >= LONG_RETRAIN_INTERVAL or not long_model.is_trained:
         long_model.train(
-            SYMBOL, LONG_TIMEFRAME, LONG_TRAINING_BARS,
-            ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD,
+            SYMBOL,
+            LONG_TIMEFRAME,
+            LONG_TRAINING_BARS,
+            ML_PREDICTION_HORIZON,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
         )
         long_train_counter = 0
 
-    # 6a.5 Get 15-minute lookahead confirmation
+    # 6a.5 Analysis & Signal Logs (Throttled to reduce noise)
+    now_ts = time.time()
+    if not hasattr(on_tick, "_last_analysis_ts"):
+        on_tick._last_analysis_ts = 0
+    show_analysis = (now_ts - on_tick._last_analysis_ts > 30) or (
+        abs(tick.bid - last_logged_bid) >= 5.0
+    )
+
     target_15m, direction_15m = get_15m_lookahead_confirmation(
         SYMBOL, TIMEFRAME, model, ML_FEATURE_WINDOW, RSI_PERIOD
     )
-    print(f"📊 15M Lookahead | Target: {target_15m:.5f} | Direction: {direction_15m}")
+    if show_analysis:
+        print(
+            f"📊 15M Lookahead | Target: {target_15m:.5f} | Direction: {direction_15m}"
+        )
 
-    # 6b. Get ML entry levels
+    # 6c. Predictions: short-term (M1) + long-term (H1) combined signal
+    prediction = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
+    long_prediction = long_model.predict(
+        SYMBOL, LONG_TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD
+    )
+    # Both models must agree on direction; otherwise signal is neutral
+    same_direction = (prediction > 0 and long_prediction > 0) or (
+        prediction < 0 and long_prediction < 0
+    )
+    confirmed_prediction = prediction if same_direction else 0.0
+    predicted_price = tick.bid + prediction
+
+    if show_analysis:
+        print(
+            f"ML Short: {prediction:+.5f} | Long: {long_prediction:+.5f} | "
+            f"Confirmed: {confirmed_prediction:+.5f} | Target: {predicted_price:.5f}"
+        )
+        on_tick._last_analysis_ts = now_ts
+
+    # 6b. Get ML entry levels (Synchronized with confirmed prediction)
     buy_level, sell_level = get_ml_entry_levels(
         SYMBOL,
         TIMEFRAME,
@@ -225,6 +283,8 @@ def on_tick() -> None:
         RSI_PERIOD,
         EMA_PERIOD,
         model,
+        prediction=confirmed_prediction,
+        verbose=show_analysis,
     )
 
     # 6b.5 Get quick-profit levels for tight TP (15m S/R based)
@@ -244,34 +304,31 @@ def on_tick() -> None:
         else (-1.0, -1.0)
     )
 
-    if buy_level > 0:
-        print(
-            f"💰 BUY Quick Profit | Tight TP: {buy_tight_tp:.5f} | Extended TP: {buy_extended_tp:.5f}"
-        )
-    if sell_level > 0:
-        print(
-            f"💰 SELL Quick Profit | Tight TP: {sell_tight_tp:.5f} | Extended TP: {sell_extended_tp:.5f}"
-        )
+    if show_analysis:
+        if buy_level > 0:
+            print(
+                f"💰 BUY Quick Profit | Tight TP: {buy_tight_tp:.5f} | Extended TP: {buy_extended_tp:.5f}"
+            )
+        if sell_level > 0:
+            print(
+                f"💰 SELL Quick Profit | Tight TP: {sell_tight_tp:.5f} | Extended TP: {sell_extended_tp:.5f}"
+            )
 
-    # 6c. Predictions: short-term (M1) + long-term (H1) combined signal
-    prediction      = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
-    long_prediction = long_model.predict(SYMBOL, LONG_TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
-    # Both models must agree on direction; otherwise signal is neutral
-    same_direction       = (prediction > 0 and long_prediction > 0) or (prediction < 0 and long_prediction < 0)
-    confirmed_prediction = prediction if same_direction else 0.0
-    predicted_price      = tick.bid + prediction
-    print(
-        f"ML Short: {prediction:+.5f} | Long: {long_prediction:+.5f} | "
-        f"Confirmed: {confirmed_prediction:+.5f} | Target: {predicted_price:.5f}"
-    )
     cancel_stale_orders(SYMBOL, confirmed_prediction)
 
     # 6c.1 Scale-In: add to position at better price if trend holds & trade is losing
     if ENABLE_SCALE_IN:
         manage_scale_in(
-            SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD,
-            RISK_PERCENT, model, MAX_TOTAL_SCALE_RISK_PERCENT,
-            SCALE_IN_VOL_MULTIPLIER, SCALE_IN_COOLDOWN_SECS,
+            SYMBOL,
+            TIMEFRAME,
+            SL_POINTS,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+            RISK_PERCENT,
+            model,
+            MAX_TOTAL_SCALE_RISK_PERCENT,
+            SCALE_IN_VOL_MULTIPLIER,
+            SCALE_IN_COOLDOWN_SECS,
         )
 
     # 6c.2 Reversal Cut-Loss: close all positions when ML confirms trend has flipped
@@ -282,9 +339,16 @@ def on_tick() -> None:
     # 6c.3 S/R Entries: sell at resistance, buy at support (+ breakouts)
     if ENABLE_SR_ENTRIES:
         execute_sr_entries(
-            SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD,
-            RISK_PERCENT, model, confirmed_prediction,
-            SR_PROXIMITY_POINTS, SR_LOOKBACK_BARS,
+            SYMBOL,
+            TIMEFRAME,
+            SL_POINTS,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+            RISK_PERCENT,
+            model,
+            confirmed_prediction,
+            SR_PROXIMITY_POINTS,
+            SR_LOOKBACK_BARS,
         )
 
     # 6d. Place new orders

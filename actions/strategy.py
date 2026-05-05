@@ -629,6 +629,7 @@ def execute_buy_market(
     rsi_period: int,
     risk_percent: float,
     model: LinearRegressionModel,
+    allow_multiple: bool = False,
 ) -> None:
     """
     Execute a Market Buy order at current ask.
@@ -637,7 +638,7 @@ def execute_buy_market(
     point = sym.point
     digits = sym.digits
 
-    if has_open_position(symbol, mt5.POSITION_TYPE_BUY):
+    if not allow_multiple and has_open_position(symbol, mt5.POSITION_TYPE_BUY):
         return
 
     ask = mt5.symbol_info_tick(symbol).ask
@@ -675,6 +676,7 @@ def execute_buy_market(
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Buy Market failed: {err}")
+
 
 def execute_sell_market(
     symbol: str,
@@ -733,6 +735,8 @@ def execute_sell_market(
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Sell Market failed: {err}")
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Utility: Find Highest High / Lowest Low
 # ══════════════════════════════════════════════════════════════════════
@@ -894,6 +898,7 @@ def get_15m_lookahead_confirmation(
 # S/R-Based Entry Strategy
 # ══════════════════════════════════════════════════════════════════════
 
+
 def execute_sr_entries(
     symbol: str,
     timeframe: int,
@@ -953,8 +958,13 @@ def execute_sr_entries(
             if not has_open_position(symbol, mt5.POSITION_TYPE_SELL):
                 print(f"📉 SELL @ resistance (momentum confirmed)")
                 execute_sell_market(
-                    symbol, timeframe, sl_points_default,
-                    feature_window, rsi_period, risk_percent, model
+                    symbol,
+                    timeframe,
+                    sl_points_default,
+                    feature_window,
+                    rsi_period,
+                    risk_percent,
+                    model,
                 )
             break
 
@@ -963,8 +973,13 @@ def execute_sr_entries(
             if not has_open_position(symbol, mt5.POSITION_TYPE_BUY):
                 print(f"🚀 BUY breakout resistance")
                 execute_buy_market(
-                    symbol, timeframe, sl_points_default,
-                    feature_window, rsi_period, risk_percent, model
+                    symbol,
+                    timeframe,
+                    sl_points_default,
+                    feature_window,
+                    rsi_period,
+                    risk_percent,
+                    model,
                 )
             break
 
@@ -981,8 +996,13 @@ def execute_sr_entries(
             if not has_open_position(symbol, mt5.POSITION_TYPE_BUY):
                 print(f"📈 BUY @ support (momentum confirmed)")
                 execute_buy_market(
-                    symbol, timeframe, sl_points_default,
-                    feature_window, rsi_period, risk_percent, model
+                    symbol,
+                    timeframe,
+                    sl_points_default,
+                    feature_window,
+                    rsi_period,
+                    risk_percent,
+                    model,
                 )
             break
 
@@ -991,8 +1011,13 @@ def execute_sr_entries(
             if not has_open_position(symbol, mt5.POSITION_TYPE_SELL):
                 print(f"💥 SELL breakout support")
                 execute_sell_market(
-                    symbol, timeframe, sl_points_default,
-                    feature_window, rsi_period, risk_percent, model
+                    symbol,
+                    timeframe,
+                    sl_points_default,
+                    feature_window,
+                    rsi_period,
+                    risk_percent,
+                    model,
                 )
             break
 
@@ -1002,12 +1027,13 @@ def execute_sr_entries(
 # ══════════════════════════════════════════════════════════════════════
 import time as _time
 
-_scale_in_last_time: dict = {}   # symbol -> last scale-in unix timestamp
+_scale_in_last_time: dict = {}  # symbol -> last scale-in unix timestamp
 
 
 # ══════════════════════════════════════════════════════════════════════
 # Scale-In Management (averaging down with risk-based position cap)
 # ══════════════════════════════════════════════════════════════════════
+
 
 def manage_scale_in(
     symbol: str,
@@ -1047,7 +1073,7 @@ def manage_scale_in(
     if not positions:
         return
 
-    buy_positions  = [p for p in positions if p.type == mt5.POSITION_TYPE_BUY]
+    buy_positions = [p for p in positions if p.type == mt5.POSITION_TYPE_BUY]
     sell_positions = [p for p in positions if p.type == mt5.POSITION_TYPE_SELL]
 
     sym = mt5.symbol_info(symbol)
@@ -1055,7 +1081,7 @@ def manage_scale_in(
         return
 
     point = sym.point
-    tick  = mt5.symbol_info_tick(symbol)
+    tick = mt5.symbol_info_tick(symbol)
     if not tick:
         return
 
@@ -1084,21 +1110,29 @@ def manage_scale_in(
                 # Widen SL of existing position
                 new_sl = round(tick.bid - sl_points_default * point * 1.5, sym.digits)
                 if pos.sl == 0 or new_sl < pos.sl:
-                    mt5.order_send({
-                        "action":   mt5.TRADE_ACTION_SLTP,
-                        "position": pos.ticket,
-                        "symbol":   symbol,
-                        "sl":       new_sl,
-                        "tp":       pos.tp,
-                    })
+                    mt5.order_send(
+                        {
+                            "action": mt5.TRADE_ACTION_SLTP,
+                            "position": pos.ticket,
+                            "symbol": symbol,
+                            "sl": new_sl,
+                            "tp": pos.tp,
+                        }
+                    )
                     print(f"   Moved SL of #{pos.ticket} -> {new_sl:.5f}")
                 # Open new buy at current better price
                 execute_buy_market(
-                    symbol, timeframe, sl_points_default, feature_window,
-                    rsi_period, risk_percent, model, allow_multiple=True,
+                    symbol,
+                    timeframe,
+                    sl_points_default,
+                    feature_window,
+                    rsi_period,
+                    risk_percent,
+                    model,
+                    allow_multiple=True,
                 )
                 _scale_in_last_time[symbol] = _time.time()
-                break   # one scale-in per cooldown cycle
+                break  # one scale-in per cooldown cycle
 
     # ── SELL positions ────────────────────────────────────────────────
     if sell_positions and len(sell_positions) < max_positions and prediction < 0:
@@ -1111,17 +1145,25 @@ def manage_scale_in(
                 )
                 new_sl = round(tick.ask + sl_points_default * point * 1.5, sym.digits)
                 if pos.sl == 0 or new_sl > pos.sl:
-                    mt5.order_send({
-                        "action":   mt5.TRADE_ACTION_SLTP,
-                        "position": pos.ticket,
-                        "symbol":   symbol,
-                        "sl":       new_sl,
-                        "tp":       pos.tp,
-                    })
+                    mt5.order_send(
+                        {
+                            "action": mt5.TRADE_ACTION_SLTP,
+                            "position": pos.ticket,
+                            "symbol": symbol,
+                            "sl": new_sl,
+                            "tp": pos.tp,
+                        }
+                    )
                     print(f"   Moved SL of #{pos.ticket} -> {new_sl:.5f}")
                 execute_sell_market(
-                    symbol, timeframe, sl_points_default, feature_window,
-                    rsi_period, risk_percent, model, allow_multiple=True,
+                    symbol,
+                    timeframe,
+                    sl_points_default,
+                    feature_window,
+                    rsi_period,
+                    risk_percent,
+                    model,
+                    allow_multiple=True,
                 )
                 _scale_in_last_time[symbol] = _time.time()
                 break
@@ -1130,6 +1172,7 @@ def manage_scale_in(
 # ══════════════════════════════════════════════════════════════════════
 # Reversal Cut-Loss (close positions when trend confirmed to have flipped)
 # ══════════════════════════════════════════════════════════════════════
+
 
 def manage_reversal_cut_loss(symbol: str, prediction: float) -> None:
     """
@@ -1155,31 +1198,35 @@ def manage_reversal_cut_loss(symbol: str, prediction: float) -> None:
                 f"\U0001f6d1 Cut-Loss: closing BUY #{pos.ticket} "
                 f"— market shifted bearish (pred={prediction:.5f})"
             )
-            mt5.order_send({
-                "action":       mt5.TRADE_ACTION_DEAL,
-                "position":     pos.ticket,
-                "symbol":       symbol,
-                "volume":       pos.volume,
-                "type":         mt5.ORDER_TYPE_SELL,
-                "price":        tick.bid,
-                "deviation":    20,
-                "type_time":    mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            })
+            mt5.order_send(
+                {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "position": pos.ticket,
+                    "symbol": symbol,
+                    "volume": pos.volume,
+                    "type": mt5.ORDER_TYPE_SELL,
+                    "price": tick.bid,
+                    "deviation": 20,
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+            )
 
         elif pos.type == mt5.POSITION_TYPE_SELL and prediction > 0:
             print(
                 f"\U0001f6d1 Cut-Loss: closing SELL #{pos.ticket} "
                 f"— market shifted bullish (pred={prediction:.5f})"
             )
-            mt5.order_send({
-                "action":       mt5.TRADE_ACTION_DEAL,
-                "position":     pos.ticket,
-                "symbol":       symbol,
-                "volume":       pos.volume,
-                "type":         mt5.ORDER_TYPE_BUY,
-                "price":        tick.ask,
-                "deviation":    20,
-                "type_time":    mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            })
+            mt5.order_send(
+                {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "position": pos.ticket,
+                    "symbol": symbol,
+                    "volume": pos.volume,
+                    "type": mt5.ORDER_TYPE_BUY,
+                    "price": tick.ask,
+                    "deviation": 20,
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+            )

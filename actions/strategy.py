@@ -215,6 +215,8 @@ def trail_sltp(
     trailing_step_points: int,
     sl_points: int,
     feature_window: int,
+    rsi_period: int,
+    model: LinearRegressionModel,
 ) -> None:
     """
     Move SL (and TP) forward as the position gains profit.
@@ -238,13 +240,14 @@ def trail_sltp(
     point = sym.point
     digits = sym.digits
 
-    # Dynamic trailing distance - wider and more robust
+    # Dynamic trailing distances using ML model
+    sl_dist, tp_dist = get_ml_sltp(
+        symbol, timeframe, sl_points, feature_window, rsi_period, model
+    )
+    # Ensure trail_dist is at least based on volatility
     current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
-    # Give the trade 2.5x volatility or at least the initial SL distance to breathe
-    trail_dist_points = max(trailing_step_points * 3.0, current_vol * 2.5)
-    # REMOVED: hard 500 cap which was choking the trades
-    trail_dist = trail_dist_points * point
-
+    sl_dist = max(sl_dist, current_vol * 2.5 * point)
+    
     stops_level = int(sym.trade_stops_level)
     safety_buf = 30 * point  # Slightly larger safety buffer
     min_dist = stops_level * point + safety_buf
@@ -272,6 +275,9 @@ def trail_sltp(
             price = ask
             profit_points = (entry - price) / point
 
+        new_sl = sl
+        new_tp = tp
+
         # 1. Break-Even Phase (Protect capital)
         # Move to entry + safety when profit reaches 2x the step
         is_breakeven_reached = profit_points >= trailing_step_points * 2
@@ -286,30 +292,38 @@ def trail_sltp(
         # Start trailing once profit reaches 4x the step
         elif profit_points >= trailing_step_points * 4:
             if pos.type == mt5.POSITION_TYPE_BUY:
-                new_sl = price - trail_dist
+                new_sl = price - sl_dist
+                new_tp = price + tp_dist
             else:
-                new_sl = price + trail_dist
+                new_sl = price + sl_dist
+                new_tp = price - tp_dist
             
             new_sl = round(new_sl, digits)
+            new_tp = round(new_tp, digits)
             
-            # Only move SL in profitable direction
+            # Only move SL/TP in profitable direction
             improve_sl = (pos.type == mt5.POSITION_TYPE_BUY and new_sl > sl) or (
                 pos.type == mt5.POSITION_TYPE_SELL and new_sl < sl
             )
-            if not improve_sl:
+            improve_tp = (pos.type == mt5.POSITION_TYPE_BUY and new_tp > tp) or (
+                pos.type == mt5.POSITION_TYPE_SELL and new_tp < tp
+            )
+            
+            if not improve_sl and not improve_tp:
                 continue
                 
-            if abs(new_sl - sl) < trailing_step_points * point:
-                continue
+            # If only TP improved but not SL, we still update. 
+            # If SL improved, check against step.
+            if improve_sl and abs(new_sl - sl) < trailing_step_points * point:
+                if not improve_tp:
+                    continue
         else:
             # Not in any phase yet
             continue
 
-        # Shared TP logic
-        if pos.type == mt5.POSITION_TYPE_BUY:
-            new_tp = round(price + sl_points * 3 * point, digits)
-        else:
-            new_tp = round(price - sl_points * 3 * point, digits)
+        # Round final values
+        new_sl = round(new_sl, digits)
+        new_tp = round(new_tp, digits)
 
         if abs(new_sl - price) < min_dist or abs(new_tp - price) < min_dist:
             continue
@@ -329,9 +343,10 @@ def trail_sltp(
             err = mt5.last_error() if result is None else result.comment
             print(
                 f"⚠️  TrailSLTP failed on #{pos.ticket}: {err} | "
-                f"Price: {price:.5f} | Proposed SL: {new_sl:.5f} TP: {new_tp:.5f} | "
-                f"Step: {trailing_step_points}"
+                f"Price: {price:.5f} | Proposed SL: {new_sl:.5f} TP: {new_tp:.5f}"
             )
+        else:
+            print(f"✅ SL/TP Updated for #{pos.ticket} | SL: {new_sl:.5f} | TP: {new_tp:.5f}")
 
 
 # ══════════════════════════════════════════════════════════════════════

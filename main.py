@@ -407,7 +407,15 @@ def on_tick() -> None:
                     )
 
     # 7. Trail SL/TP every tick
-    trail_sltp(SYMBOL, TIMEFRAME, TRAILING_STEP_POINTS, SL_POINTS, ML_FEATURE_WINDOW)
+    trail_sltp(
+        SYMBOL,
+        TIMEFRAME,
+        TRAILING_STEP_POINTS,
+        SL_POINTS,
+        ML_FEATURE_WINDOW,
+        RSI_PERIOD,
+        model,
+    )
 
 
 def main() -> None:

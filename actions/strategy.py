@@ -278,52 +278,32 @@ def trail_sltp(
         new_sl = sl
         new_tp = tp
 
-        # 1. Break-Even Phase (Protect capital)
-        # Move to entry + safety when profit reaches 2x the step
-        is_breakeven_reached = profit_points >= trailing_step_points * 2
-        is_already_at_be = (pos.type == mt5.POSITION_TYPE_BUY and sl >= entry + safety_buf) or \
-                           (pos.type == mt5.POSITION_TYPE_SELL and sl <= entry - safety_buf)
-        
-        if is_breakeven_reached and not is_already_at_be:
-            new_sl = round(entry + safety_buf if pos.type == mt5.POSITION_TYPE_BUY else entry - safety_buf, digits)
-            print(f"🛡️ Break-Even activated for #{pos.ticket} (Profit: {profit_points:.1f}pts)")
-        
-        # 2. Active Trailing Phase (Lock in gains)
-        # Start trailing once profit reaches 4x the step
-        elif profit_points >= trailing_step_points * 4:
-            if pos.type == mt5.POSITION_TYPE_BUY:
-                new_sl = price - sl_dist
-                new_tp = price + tp_dist
-            else:
-                new_sl = price + sl_dist
-                new_tp = price - tp_dist
-            
-            new_sl = round(new_sl, digits)
-            new_tp = round(new_tp, digits)
-            
-            # Only move SL/TP in profitable direction
-            improve_sl = (pos.type == mt5.POSITION_TYPE_BUY and new_sl > sl) or (
-                pos.type == mt5.POSITION_TYPE_SELL and new_sl < sl
-            )
-            improve_tp = (pos.type == mt5.POSITION_TYPE_BUY and new_tp > tp) or (
-                pos.type == mt5.POSITION_TYPE_SELL and new_tp < tp
-            )
-            
-            if not improve_sl and not improve_tp:
-                continue
-                
-            # If only TP improved but not SL, we still update. 
-            # If SL improved, check against step.
-            if improve_sl and abs(new_sl - sl) < trailing_step_points * point:
-                if not improve_tp:
-                    continue
+        # Calculate target SL and TP based on current price and ML-driven distances
+        if pos.type == mt5.POSITION_TYPE_BUY:
+            target_sl = round(price - sl_dist, digits)
+            target_tp = round(price + tp_dist, digits)
         else:
-            # Not in any phase yet
-            continue
+            target_sl = round(price + sl_dist, digits)
+            target_tp = round(price - tp_dist, digits)
 
-        # Round final values
-        new_sl = round(new_sl, digits)
-        new_tp = round(new_tp, digits)
+        new_sl = sl
+        new_tp = tp
+
+        # Move SL if price is in profit and target SL is an improvement
+        if profit_points > 0:
+            is_better_sl = (pos.type == mt5.POSITION_TYPE_BUY and target_sl > sl) or \
+                           (pos.type == mt5.POSITION_TYPE_SELL and target_sl < sl)
+            
+            # Check improvement against trailing_step_points
+            if is_better_sl and abs(target_sl - sl) >= (trailing_step_points * point):
+                new_sl = target_sl
+                new_tp = target_tp
+            else:
+                # If we don't meet the trailing step, keep existing SL/TP
+                continue
+        else:
+            # Not in profit, no trailing
+            continue
 
         if abs(new_sl - price) < min_dist or abs(new_tp - price) < min_dist:
             continue

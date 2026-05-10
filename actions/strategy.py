@@ -1210,6 +1210,19 @@ def manage_reversal_cut_loss(
     Both the short-term (M1) and long-term (H1) models must agree on the
     reversal before closing (call this with the combined signal from main.py).
     """
+    # ── Save Reversal to ChromaDB (Throttled by Trend Change) ───────────
+    if not hasattr(manage_reversal_cut_loss, "_last_sign"):
+        manage_reversal_cut_loss._last_sign = 0
+    
+    current_sign = 1 if prediction > 0 else (-1 if prediction < 0 else 0)
+    
+    if current_sign != 0 and current_sign != manage_reversal_cut_loss._last_sign:
+        from tools.chroma_db import db
+        tick = mt5.symbol_info_tick(symbol)
+        if tick:
+            db.save_reversal(symbol, tick.bid, prediction)
+            manage_reversal_cut_loss._last_sign = current_sign
+    # ──────────────────────────────────────────────────────────────────
     positions = get_symbol_positions(symbol)
     if not positions:
         return

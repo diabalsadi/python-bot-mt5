@@ -417,6 +417,28 @@ def on_tick() -> None:
         model,
     )
 
+    # 8. Persistent Market Data (Save to ChromaDB for LLM analysis)
+    # Throttled to every 5 minutes to avoid excessive DB writes
+    now_ts = time.time()
+    if not hasattr(on_tick, "_last_chroma_ts"):
+        on_tick._last_chroma_ts = 0
+        
+    if now_ts - on_tick._last_chroma_ts >= 300: # 5 minute interval
+        from tools.chroma_db import db
+        from indicators.support_resistance import identify_sr_levels
+        from indicators.liquidity_zones import get_liquidity_zones
+        
+        # Capture current technical landscape
+        supports, resistances = identify_sr_levels(SYMBOL, TIMEFRAME, SR_LOOKBACK_BARS)
+        zones = get_liquidity_zones(SYMBOL, TIMEFRAME, SR_LOOKBACK_BARS)
+        
+        # Save to DB
+        db.save_sr_levels(SYMBOL, supports, resistances)
+        db.save_liquidity_zones(SYMBOL, zones)
+        
+        print(f"💾 Market data snapshot saved to ChromaDB (S:{len(supports)} R:{len(resistances)} Z:{len(zones)})")
+        on_tick._last_chroma_ts = now_ts
+
 
 def main() -> None:
     global model

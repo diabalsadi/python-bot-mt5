@@ -32,6 +32,23 @@ from indicators.trend import get_technical_trend
 from ml.model import LinearRegressionModel
 
 
+import re
+
+def _clean_comment(text: str) -> str:
+    """Clean comment: strip non-ASCII, non-alphanumeric, no spaces, truncate to 15 chars."""
+    if not isinstance(text, str):
+        return "MLTrade"
+    
+    # Strip non-ASCII
+    clean = text.encode("ascii", "ignore").decode("ascii")
+    # Replace newlines with spaces
+    clean = clean.replace("\n", " ").replace("\r", " ")
+    # Keep only alphanumeric (NO SPACES)
+    clean = re.sub(r'[^a-zA-Z0-9]', '', clean)
+    # Truncate to 15
+    return clean[:15].strip()
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Lot Sizing
 # ══════════════════════════════════════════════════════════════════════
@@ -247,7 +264,7 @@ def trail_sltp(
     # Ensure trail_dist is at least based on volatility
     current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
     sl_dist = max(sl_dist, current_vol * 2.5 * point)
-    
+
     stops_level = int(sym.trade_stops_level)
     safety_buf = 30 * point  # Slightly larger safety buffer
     min_dist = stops_level * point + safety_buf
@@ -291,9 +308,10 @@ def trail_sltp(
 
         # Move SL if price is in profit and target SL is an improvement
         if profit_points > 0:
-            is_better_sl = (pos.type == mt5.POSITION_TYPE_BUY and target_sl > sl) or \
-                           (pos.type == mt5.POSITION_TYPE_SELL and target_sl < sl)
-            
+            is_better_sl = (pos.type == mt5.POSITION_TYPE_BUY and target_sl > sl) or (
+                pos.type == mt5.POSITION_TYPE_SELL and target_sl < sl
+            )
+
             # Check improvement against trailing_step_points
             if is_better_sl and abs(target_sl - sl) >= (trailing_step_points * point):
                 new_sl = target_sl
@@ -326,7 +344,9 @@ def trail_sltp(
                 f"Price: {price:.5f} | Proposed SL: {new_sl:.5f} TP: {new_tp:.5f}"
             )
         else:
-            print(f"✅ SL/TP Updated for #{pos.ticket} | SL: {new_sl:.5f} | TP: {new_tp:.5f}")
+            print(
+                f"✅ SL/TP Updated for #{pos.ticket} | SL: {new_sl:.5f} | TP: {new_tp:.5f}"
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -648,6 +668,7 @@ def execute_buy_market(
     rsi_period: int,
     risk_percent: float,
     model: LinearRegressionModel,
+    reasoning: str = "ML buy market",
     allow_multiple: bool = False,
 ) -> None:
     """
@@ -685,7 +706,7 @@ def execute_buy_market(
         "deviation": 20,
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
-        "comment": "ML buy market",
+        "comment": _clean_comment(reasoning),
     }
     t0 = time.perf_counter()
     result = mt5.order_send(request)
@@ -705,6 +726,7 @@ def execute_sell_market(
     rsi_period: int,
     risk_percent: float,
     model: LinearRegressionModel,
+    reasoning: str = "ML sell market",
     allow_multiple: bool = False,  # ✅ FIXED
 ) -> None:
     """
@@ -743,7 +765,7 @@ def execute_sell_market(
         "deviation": 20,
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
-        "comment": "ML sell market",
+        "comment": _clean_comment(reasoning),
     }
 
     t0 = time.perf_counter()
@@ -1213,11 +1235,12 @@ def manage_reversal_cut_loss(
     # ── Save Reversal to ChromaDB (Throttled by Trend Change) ───────────
     if not hasattr(manage_reversal_cut_loss, "_last_sign"):
         manage_reversal_cut_loss._last_sign = 0
-    
+
     current_sign = 1 if prediction > 0 else (-1 if prediction < 0 else 0)
-    
+
     if current_sign != 0 and current_sign != manage_reversal_cut_loss._last_sign:
         from tools.chroma_db import db
+
         tick = mt5.symbol_info_tick(symbol)
         if tick:
             db.save_reversal(symbol, tick.bid, prediction)

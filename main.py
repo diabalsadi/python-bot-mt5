@@ -10,6 +10,9 @@ Run:
 import time
 import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import MetaTrader5 as mt5
 
@@ -46,21 +49,23 @@ from mt5_tool.symbol import get_symbol, stream_ticks
 from tools.print import pretty_print
 
 # ──────────────────────────────────────────────────────────────────────
-# Configuration  (mirrors MQL5 input block)
+# Configuration
 # ──────────────────────────────────────────────────────────────────────
-SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSDm")
+# Read symbols from .env (comma-separated if multiple)
+SYMBOLS = [s.strip() for s in os.getenv("MT5_SYMBOL", "XAUUSDm").split(",") if s.strip()]
 TIMEFRAME = mt5.TIMEFRAME_M1
+TIMEFRAME_M5 = mt5.TIMEFRAME_M5
 
-# ML — short-term model (M1, last 150 bars for fast adaptation)
+# ML — short-term model (M1)
 ML_TRAINING_BARS = 150
 ML_FEATURE_WINDOW = 12
-ML_RETRAIN_INTERVAL = 10  # bars between retrains
+ML_RETRAIN_INTERVAL = 10 
 ML_PREDICTION_HORIZON = 15
 
-# ML — long-term trend model (H1, ~3 months = 2160 bars)
+# ML — long-term trend model (H1)
 LONG_TIMEFRAME = mt5.TIMEFRAME_H1
-LONG_TRAINING_BARS = 2160  # ~3 months of H1 candles
-LONG_RETRAIN_INTERVAL = 60  # retrain long model every 60 short ticks
+LONG_TRAINING_BARS = 2160
+LONG_RETRAIN_INTERVAL = 60
 
 # Indicators
 RSI_PERIOD = 14
@@ -70,11 +75,11 @@ TREND_BARS = 5
 
 # Risk / order management
 SL_POINTS = 2000
-RISK_PERCENT = 10.0
+RISK_PERCENT = 2.0
 TRAILING_STEP_POINTS = 50
 EXPIRATION_HOURS = 50
 MIN_ORDER_DISTANCE_PTS = 500
-RESET_ORDERS_INTERVAL = 30  # minutes
+RESET_ORDERS_INTERVAL = 30
 
 # Protection
 AVOID_HIGH_VOLATILITY = False
@@ -85,43 +90,36 @@ USE_US_OPEN_PROTECTION = False
 US_OPEN_PROTECTION_HRS = 2
 US_START_HOUR = 15
 
-# Scale-In / Cut-Loss strategy
-ENABLE_SCALE_IN = True  # Average-down when trade loses but trend holds
-MAX_TOTAL_SCALE_RISK_PERCENT = 30.0  # Total risk budget; cap = this / RISK_PERCENT
-SCALE_IN_VOL_MULTIPLIER = 1.0  # Loss threshold = volatility × this value
-SCALE_IN_COOLDOWN_SECS = 60.0  # Min seconds between scale-in trades per symbol
-ENABLE_REVERSAL_CUT_LOSS = True  # Close positions when BOTH models confirm reversal
-
-# S/R Entry strategy
-ENABLE_SR_ENTRIES = True  # Trade bounces + breakouts from S/R levels
-SR_PROXIMITY_POINTS = 150  # Points from level to trigger mean-reversion entry
-SR_LOOKBACK_BARS = 50  # Bars used to detect S/R levels
-
+# Strategy features
+ENABLE_SCALE_IN = True
+ENABLE_REVERSAL_CUT_LOSS = True
+ENABLE_SR_ENTRIES = True
+SR_LOOKBACK_BARS = 50
 
 # ──────────────────────────────────────────────────────────────────────
-# State
+# State (Multi-Symbol Dictionaries)
 # ──────────────────────────────────────────────────────────────────────
-model = LinearRegressionModel()  # short-term M1 model
-long_model = LinearRegressionModel()  # long-term H1 model (3 months)
-total_bars = 0
-ml_train_counter = 0
-long_train_counter = 0
+models = {s: LinearRegressionModel() for s in SYMBOLS}
+m5_models = {s: LinearRegressionModel() for s in SYMBOLS}
+long_models = {s: LinearRegressionModel() for s in SYMBOLS}
+last_bar_times = {s: 0 for s in SYMBOLS}
+last_bar_times_m5 = {s: 0 for s in SYMBOLS}
+last_tick_time_msc = {s: 0 for s in SYMBOLS}
+last_logged_bid = {s: 0.0 for s in SYMBOLS}
+long_train_counters = {s: 0 for s in SYMBOLS}
 last_deletion_ts = 0.0
-last_tick_time_msc = 0
-last_bar_time = 0
-last_logged_bid = 0.0
 
 # ──────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _bars_available() -> int:
-    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
+def _bars_available(symbol: str) -> int:
+    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, 1)
     if rates is None:
         return 0
     return int(
-        mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 5000).shape[0]
+        mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, 5000).shape[0]
     )  # approximate
 
 
@@ -130,285 +128,166 @@ def _bars_available() -> int:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def on_tick() -> None:
-    """Called on every price tick — mirrors MQL5 OnTick()."""
-    global total_bars, ml_train_counter, long_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid, last_bar_time
+def on_tick(symbol: str) -> None:
+    """Called on every price tick for a specific symbol."""
+    global last_deletion_ts
+
+    model = models[symbol]
+    model_m5 = m5_models[symbol]
+    long_model = long_models[symbol]
 
     # Measure tick latency
     t0 = time.perf_counter()
-    tick = mt5.symbol_info_tick(SYMBOL)
+    tick = mt5.symbol_info_tick(symbol)
     app_terminal_speed_ms = int((time.perf_counter() - t0) * 1000)
 
-    if tick is not None and tick.time_msc != last_tick_time_msc:
-        last_tick_time_msc = tick.time_msc
+    if tick is not None and tick.time_msc != last_tick_time_msc[symbol]:
+        last_tick_time_msc[symbol] = tick.time_msc
 
         # 0. Market Status Guard
-        is_open, status_msg = check_symbol_trading_status(SYMBOL)
+        is_open, status_msg = check_symbol_trading_status(symbol)
         if not is_open:
-            # Log once every 30 seconds to avoid spam
-            now = time.time()
+            # Throttled logging per symbol
             if not hasattr(on_tick, "_last_status_log"):
-                on_tick._last_status_log = 0
-            if now - on_tick._last_status_log > 30:
-                print(f"⚠️  PAUSED (Market Status: {status_msg})")
-                on_tick._last_status_log = now
+                on_tick._last_status_log = {}
+            now = time.time()
+            if symbol not in on_tick._last_status_log or now - on_tick._last_status_log[symbol] > 30:
+                print(f"⚠️  {symbol} PAUSED (Market Status: {status_msg})")
+                on_tick._last_status_log[symbol] = now
             return
 
-        if abs(tick.bid - last_logged_bid) >= 1.0:
-            last_logged_bid = tick.bid
+        if abs(tick.bid - last_logged_bid[symbol]) >= 1.0:
+            last_logged_bid[symbol] = tick.bid
 
             terminal_info = mt5.terminal_info()
             broker_ping_ms = int(terminal_info.ping_last / 1000) if terminal_info else 0
 
             logging.info(
-                f"PRICE UPDATE | {SYMBOL} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | "
-                f"Step: {TRAILING_STEP_POINTS} | Broker: {broker_ping_ms}ms | App: {app_terminal_speed_ms}ms"
+                f"PRICE UPDATE | {symbol} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | "
+                f"Broker: {broker_ping_ms}ms | App: {app_terminal_speed_ms}ms"
             )
-            if model.is_trained:
-                # Only print weights once per training cycle
-                if (
-                    not hasattr(on_tick, "_last_model_time")
-                    or on_tick._last_model_time != last_bar_time
-                ):
-                    print(
-                        f"🤖 ML Model Updated | "
-                        f"β0={model.beta0:.4f}  β1={model.beta1:.4f}  "
-                        f"β2={model.beta2:.4f}  β3={model.beta3:.4f}  β4={model.beta4:.4f}  "
-                        f"β5={model.beta5:.4f}  β6={model.beta6:.4f}"
-                    )
-                    on_tick._last_model_time = last_bar_time
 
     # 1. US open protection (highest priority)
     if USE_US_OPEN_PROTECTION and check_us_session_exclusion(
         US_START_HOUR, US_OPEN_PROTECTION_HRS
     ):
-        session = get_market_session(us_start=US_START_HOUR)
-        print(f"⚠️  PAUSED (US Open protection) | Session: {session}")
         return
 
     # 2. Latency guard
     if ENABLE_LATENCY_CHECK:
-        ok, latency = check_latency(SYMBOL, MAX_LATENCY_MS)
+        ok, latency = check_latency(symbol, MAX_LATENCY_MS)
         if not ok:
-            print(f"⚠️  PAUSED (latency {latency} ms > {MAX_LATENCY_MS} ms)")
             return
 
     # 3. High-volatility guard
     if AVOID_HIGH_VOLATILITY:
         is_high, cur_atr, avg_atr = check_high_volatility(
-            SYMBOL, TIMEFRAME, ATR_PERIOD, VOLATILITY_MULTIPLIER
+            symbol, TIMEFRAME, ATR_PERIOD, VOLATILITY_MULTIPLIER
         )
         if is_high:
-            print(f"⚠️  PAUSED (high volatility) | ATR={cur_atr:.5f} avg={avg_atr:.5f}")
             return
 
-    # 4. Periodic order reset
+    # 4. Periodic order reset (only once per loop, not per symbol)
+    # This is handled outside the symbol loop in a real implementation usually, 
+    # but here we can just do it once.
     now = time.time()
     if last_deletion_ts == 0:
         last_deletion_ts = now
     elif (now - last_deletion_ts) >= RESET_ORDERS_INTERVAL * 60:
-        print(f"🗑️  Resetting all pending orders ({RESET_ORDERS_INTERVAL} min interval)")
-        cancel_all_orders(SYMBOL)
+        for s in SYMBOLS:
+            cancel_all_orders(s)
         last_deletion_ts = now
 
-    # 6a. Short-term model retraining (M1, only on NEW BAR to save CPU)
-    current_rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
+    # 6a. Short-term model retraining (M1, only on NEW BAR)
+    current_rates = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, 1)
     if current_rates is not None:
         this_bar_time = int(current_rates[0]["time"])
-        if this_bar_time != last_bar_time or not model.is_trained:
+        if this_bar_time != last_bar_times[symbol] or not model.is_trained:
             model.train(
-                SYMBOL,
+                symbol,
                 TIMEFRAME,
                 ML_TRAINING_BARS,
                 ML_PREDICTION_HORIZON,
                 ML_FEATURE_WINDOW,
                 RSI_PERIOD,
             )
-            last_bar_time = this_bar_time
+            last_bar_times[symbol] = this_bar_time
 
-    # 6a.1 Long-term trend model retraining (H1, ~3 months, less frequent)
-    long_train_counter += 1
-    if long_train_counter >= LONG_RETRAIN_INTERVAL or not long_model.is_trained:
+    # 6b. M5 model retraining (Only on NEW M5 BAR)
+    rates_m5 = mt5.copy_rates_from_pos(symbol, TIMEFRAME_M5, 0, 1)
+    if rates_m5 is not None:
+        bar_time_m5 = int(rates_m5[0]["time"])
+        if bar_time_m5 != last_bar_times_m5[symbol] or not model_m5.is_trained:
+            model_m5.train(
+                symbol,
+                TIMEFRAME_M5,
+                ML_TRAINING_BARS,
+                ML_PREDICTION_HORIZON,
+                ML_FEATURE_WINDOW,
+                RSI_PERIOD,
+            )
+            last_bar_times_m5[symbol] = bar_time_m5
+
+    # 6a.1 Long-term trend model retraining
+    long_train_counters[symbol] += 1
+    if long_train_counters[symbol] >= LONG_RETRAIN_INTERVAL or not long_model.is_trained:
         long_model.train(
-            SYMBOL,
+            symbol,
             LONG_TIMEFRAME,
             LONG_TRAINING_BARS,
             ML_PREDICTION_HORIZON,
             ML_FEATURE_WINDOW,
             RSI_PERIOD,
         )
-        long_train_counter = 0
+        long_train_counters[symbol] = 0
 
-    # 6a.5 Analysis & Signal Logs (Throttled to reduce noise)
+    # 6. LLM Agent Decision (Throttled per symbol)
     now_ts = time.time()
-    if not hasattr(on_tick, "_last_analysis_ts"):
-        on_tick._last_analysis_ts = 0
-    show_analysis = (now_ts - on_tick._last_analysis_ts > 30) or (
-        abs(tick.bid - last_logged_bid) >= 5.0
-    )
+    if not hasattr(on_tick, "_last_llm_ts"):
+        on_tick._last_llm_ts = {}
+        
+    if symbol not in on_tick._last_llm_ts or now_ts - on_tick._last_llm_ts[symbol] >= 60:
+        from tools.market_context import get_market_snapshot, format_snapshot_for_llm
+        from tools.ollama_agent import agent
+        
+        config = {
+            'SR_LOOKBACK_BARS': SR_LOOKBACK_BARS,
+            'ML_FEATURE_WINDOW': ML_FEATURE_WINDOW,
+            'RSI_PERIOD': RSI_PERIOD,
+            'LONG_TIMEFRAME': LONG_TIMEFRAME
+        }
+        
+        snapshot = get_market_snapshot(symbol, TIMEFRAME, model, model_m5, long_model, config)
+        if snapshot:
+            prompt_context = format_snapshot_for_llm(snapshot)
+            print(f"🧠 LLM is analyzing {symbol}...")
+            decision = agent.get_decision(prompt_context)
+            
+            action = decision.get("action", "HOLD")
+            reasoning = decision.get("reasoning", "No reasoning provided.")
+            
+            print(f"🤖 {symbol} AGENT DECISION: {action}")
+            print(f"📝 REASONING: {reasoning}")
+            
+            if action == "BUY":
+                execute_buy_market(symbol, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD, RISK_PERCENT, model, reasoning=reasoning)
+            elif action == "SELL":
+                execute_sell_market(symbol, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD, RISK_PERCENT, model, reasoning=reasoning)
+            elif action == "CLOSE_ALL":
+                from actions.strategy import close_all_positions, cancel_all_orders
+                close_all_positions(symbol)
+                cancel_all_orders(symbol)
+            
+            on_tick._last_llm_ts[symbol] = now_ts
 
-    target_15m, direction_15m = get_15m_lookahead_confirmation(
-        SYMBOL, TIMEFRAME, model, ML_FEATURE_WINDOW, RSI_PERIOD
-    )
-    if show_analysis:
-        print(
-            f"📊 15M Lookahead | Target: {target_15m:.5f} | Direction: {direction_15m}"
-        )
-
-    # 6c. Predictions: short-term (M1) + long-term (H1) combined signal
-    prediction = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
-    long_prediction = long_model.predict(
-        SYMBOL, LONG_TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD
-    )
-    # Both models must agree on direction; otherwise signal is neutral
-    same_direction = (prediction > 0 and long_prediction > 0) or (
-        prediction < 0 and long_prediction < 0
-    )
-    confirmed_prediction = prediction if same_direction else 0.0
-    predicted_price = tick.bid + prediction
-
-    if show_analysis:
-        print(
-            f"ML Short: {prediction:+.5f} | Long: {long_prediction:+.5f} | "
-            f"Confirmed: {confirmed_prediction:+.5f} | Target: {predicted_price:.5f}"
-        )
-        on_tick._last_analysis_ts = now_ts
-
-    # 6b. Get ML entry levels (Synchronized with confirmed prediction)
-    buy_level, sell_level = get_ml_entry_levels(
-        SYMBOL,
-        TIMEFRAME,
-        TREND_BARS,
-        ML_FEATURE_WINDOW,
-        RSI_PERIOD,
-        EMA_PERIOD,
-        model,
-        prediction=confirmed_prediction,
-        verbose=show_analysis,
-    )
-
-    # 6b.5 Get quick-profit levels for tight TP (15m S/R based)
-    buy_tight_tp, buy_extended_tp = (
-        get_quick_profit_levels(
-            SYMBOL, TIMEFRAME, 1, model, ML_FEATURE_WINDOW, RSI_PERIOD
-        )
-        if buy_level > 0
-        else (-1.0, -1.0)
-    )
-
-    sell_tight_tp, sell_extended_tp = (
-        get_quick_profit_levels(
-            SYMBOL, TIMEFRAME, -1, model, ML_FEATURE_WINDOW, RSI_PERIOD
-        )
-        if sell_level > 0
-        else (-1.0, -1.0)
-    )
-
-    if show_analysis:
-        if buy_level > 0:
-            print(
-                f"💰 BUY Quick Profit | Tight TP: {buy_tight_tp:.5f} | Extended TP: {buy_extended_tp:.5f}"
-            )
-        if sell_level > 0:
-            print(
-                f"💰 SELL Quick Profit | Tight TP: {sell_tight_tp:.5f} | Extended TP: {sell_extended_tp:.5f}"
-            )
-
-    cancel_stale_orders(SYMBOL, confirmed_prediction)
-
-    # 6c.1 Scale-In: add to position at better price if trend holds & trade is losing
-    if ENABLE_SCALE_IN:
-        manage_scale_in(
-            SYMBOL,
-            TIMEFRAME,
-            SL_POINTS,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
-            RISK_PERCENT,
-            model,
-            MAX_TOTAL_SCALE_RISK_PERCENT,
-            SCALE_IN_VOL_MULTIPLIER,
-            SCALE_IN_COOLDOWN_SECS,
-        )
-
-    # 6c.2 Reversal Cut-Loss: close all positions when ML confirms trend has flipped
+    # 6c.2 Reversal Cut-Loss
     if ENABLE_REVERSAL_CUT_LOSS:
-        # Only cut losses when BOTH models confirm the reversal
-        manage_reversal_cut_loss(SYMBOL, confirmed_prediction)
+        prediction = model.predict(symbol, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
+        manage_reversal_cut_loss(symbol, prediction)
 
-    # 6c.3 S/R Entries: sell at resistance, buy at support (+ breakouts)
-    if ENABLE_SR_ENTRIES:
-        execute_sr_entries(
-            SYMBOL,
-            TIMEFRAME,
-            SL_POINTS,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
-            RISK_PERCENT,
-            model,
-            confirmed_prediction,
-            SR_PROXIMITY_POINTS,
-            SR_LOOKBACK_BARS,
-        )
-
-    # 6d. Place new orders
-    if buy_level > 0:
-        execute_buy_market(
-            SYMBOL,
-            TIMEFRAME,
-            SL_POINTS,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
-            RISK_PERCENT,
-            model,
-        )
-
-    if sell_level > 0:
-        execute_sell_market(
-            SYMBOL,
-            TIMEFRAME,
-            SL_POINTS,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
-            RISK_PERCENT,
-            model,
-        )
-
-    # 6e. Place Fibonacci orders
-    fibo_levels = get_m30_fibo_levels(SYMBOL)
-    if fibo_levels:
-        is_bullish = fibo_levels.get("is_bullish", False)
-        # If prediction is positive and M30 bar was bullish (retracing down for support)
-        if prediction > 0 and is_bullish:
-            for level_name in ["pullback_50", "pullback_61"]:
-                if level_name in fibo_levels:
-                    execute_buy_market(
-                        SYMBOL,
-                        TIMEFRAME,
-                        SL_POINTS,
-                        ML_FEATURE_WINDOW,
-                        RSI_PERIOD,
-                        RISK_PERCENT / 2.0,  # Risk half on fibo entries
-                        model,
-                    )
-
-        # If prediction is negative and M30 bar was bearish (retracing up for resistance)
-        elif prediction < 0 and not is_bullish:
-            for level_name in ["pullback_50", "pullback_61"]:
-                if level_name in fibo_levels:
-                    execute_sell_market(
-                        SYMBOL,
-                        TIMEFRAME,
-                        SL_POINTS,
-                        ML_FEATURE_WINDOW,
-                        RSI_PERIOD,
-                        RISK_PERCENT / 2.0,  # Risk half on fibo entries
-                        model,
-                    )
-
-    # 7. Trail SL/TP every tick
+    # 7. Trail SL/TP
     trail_sltp(
-        SYMBOL,
+        symbol,
         TIMEFRAME,
         TRAILING_STEP_POINTS,
         SL_POINTS,
@@ -417,66 +296,55 @@ def on_tick() -> None:
         model,
     )
 
-    # 8. Persistent Market Data (Save to ChromaDB for LLM analysis)
-    # Throttled to every 5 minutes to avoid excessive DB writes
-    now_ts = time.time()
+    # 8. Persistent Market Data
     if not hasattr(on_tick, "_last_chroma_ts"):
-        on_tick._last_chroma_ts = 0
-        
-    if now_ts - on_tick._last_chroma_ts >= 300: # 5 minute interval
+        on_tick._last_chroma_ts = {}
+    if symbol not in on_tick._last_chroma_ts or now_ts - on_tick._last_chroma_ts[symbol] >= 300:
         from tools.chroma_db import db
         from indicators.support_resistance import identify_sr_levels
         from indicators.liquidity_zones import get_liquidity_zones
-        
-        # Capture current technical landscape
-        supports, resistances = identify_sr_levels(SYMBOL, TIMEFRAME, SR_LOOKBACK_BARS)
-        zones = get_liquidity_zones(SYMBOL, TIMEFRAME, SR_LOOKBACK_BARS)
-        
-        # Save to DB
-        db.save_sr_levels(SYMBOL, supports, resistances)
-        db.save_liquidity_zones(SYMBOL, zones)
-        
-        print(f"💾 Market data snapshot saved to ChromaDB (S:{len(supports)} R:{len(resistances)} Z:{len(zones)})")
-        on_tick._last_chroma_ts = now_ts
+        supports, resistances = identify_sr_levels(symbol, TIMEFRAME, SR_LOOKBACK_BARS)
+        zones = get_liquidity_zones(symbol, TIMEFRAME, SR_LOOKBACK_BARS)
+        db.save_sr_levels(symbol, supports, resistances)
+        db.save_liquidity_zones(symbol, zones)
+        on_tick._last_chroma_ts[symbol] = now_ts
 
 
 def main() -> None:
-    global model
-
     initialize_connection()
     pretty_print(mt5.account_info(), "Account Info")
 
-    symbol = get_symbol(SYMBOL)
-    if not symbol:
-        mt5.shutdown()
-        return
+    for symbol_name in SYMBOLS:
+        symbol = get_symbol(symbol_name)
+        if not symbol:
+            print(f"❌ Symbol {symbol_name} not found!")
+            continue
 
-    # Initial model training
-    req_bars = (
-        ML_TRAINING_BARS + ML_PREDICTION_HORIZON + ML_FEATURE_WINDOW + RSI_PERIOD + 10
-    )
-    available = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, req_bars)
-    if available is not None and len(available) >= req_bars:
-        model.train(
-            symbol,
-            TIMEFRAME,
-            ML_TRAINING_BARS,
-            ML_PREDICTION_HORIZON,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
+        # Initial model training (M1, M5)
+        model = models[symbol_name]
+        model_m5 = m5_models[symbol_name]
+        req_bars = (
+            ML_TRAINING_BARS + ML_PREDICTION_HORIZON + ML_FEATURE_WINDOW + RSI_PERIOD + 10
         )
-    else:
-        print(
-            f"⚠️  Not enough bars for initial training (need {req_bars}). "
-            "Model will train after enough bars accumulate."
-        )
+        # Train M1
+        available = mt5.copy_rates_from_pos(symbol_name, TIMEFRAME, 0, req_bars)
+        if available is not None and len(available) >= req_bars:
+            model.train(symbol_name, TIMEFRAME, ML_TRAINING_BARS, ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD)
+        
+        # Train M5
+        available_m5 = mt5.copy_rates_from_pos(symbol_name, TIMEFRAME_M5, 0, req_bars)
+        if available_m5 is not None and len(available_m5) >= req_bars:
+            model_m5.train(symbol_name, TIMEFRAME_M5, ML_TRAINING_BARS, ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD)
+        else:
+            print(f"⚠️  {symbol_name}: Not enough M5 bars for initial training.")
 
-    print(f"\n🚀 Gold Scalper v3 running on {symbol} {TIMEFRAME} (Ctrl+C to stop)\n")
+    print(f"\n🚀 Multi-Symbol Scalper running on {SYMBOLS} (Ctrl+C to stop)\n")
 
     try:
         while True:
-            on_tick()
-            time.sleep(0.1)  # ~10 ticks/sec; adjust as needed
+            for symbol in SYMBOLS:
+                on_tick(symbol)
+            time.sleep(0.1)
     except KeyboardInterrupt:
         print("\n🛑 Stopped by user")
     finally:

@@ -16,6 +16,7 @@ build/
 # Logs & runtime output
 *.log
 latency.log
+trades.csv
 
 # Virtual environments
 .venv/

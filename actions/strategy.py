@@ -30,6 +30,14 @@ import MetaTrader5 as mt5
 from indicators.volatility import calculate_volatility
 from indicators.trend import get_technical_trend
 from ml.model import LinearRegressionModel
+from tools.trade_logger import TradeLogger
+
+_trade_logger = TradeLogger()
+
+# Module-level state (replaces function-attribute hacks)
+_trail_debug_cnt: dict[int, int] = {}
+_trail_last_err: str = ""
+_scale_in_last_log_ts: float = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -362,12 +370,11 @@ def trail_sltp(
             if target_tp > price - min_dist: target_tp = round(price - min_dist, digits)
 
         # DEBUG: Throttled feedback
-        if not hasattr(trail_sltp, "_debug_cnt"): trail_sltp._debug_cnt = {}
-        cnt = trail_sltp._debug_cnt.get(pos.ticket, 0)
+        cnt = _trail_debug_cnt.get(pos.ticket, 0)
         if profit_points > 10 and cnt % 100 == 0:
             print(f"🔄 {stage} #{pos.ticket} | Prof: {profit_points:.1f}pt | "
                   f"SL: {sl:.5f}->{target_sl:.5f} | Better: {is_better_sl}")
-        trail_sltp._debug_cnt[pos.ticket] = cnt + 1
+        _trail_debug_cnt[pos.ticket] = cnt + 1
 
         # ── EXECUTE ─────────────────────────────────────────────────
         if profit_points > 0 and is_better_sl:
@@ -387,11 +394,12 @@ def trail_sltp(
                     logging.info(f"ACTION | TrailSLTP {stage} #{pos.ticket} | SL: {target_sl:.5f}")
                     print(f"✅ {stage} Updated #{pos.ticket} | SL: {target_sl:.5f}")
                 else:
+                    global _trail_last_err
                     err = mt5.last_error() if result is None else result.comment
-                    if not hasattr(trail_sltp, "_last_err") or trail_sltp._last_err != err:
+                    if _trail_last_err != err:
                         logging.error(f"FAIL | TrailSLTP #{pos.ticket} | Error: {err}")
                         print(f"❌ TrailSLTP Fail: {err}")
-                        trail_sltp._last_err = err
+                        _trail_last_err = err
 
 
 
@@ -764,6 +772,8 @@ def execute_buy_market(
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Buy Market failed: {err}")
+    else:
+        _trade_logger.log_open(result, symbol, "BUY", entry, sl, tp, lot, "ML buy market")
 
 
 def execute_sell_market(
@@ -823,6 +833,8 @@ def execute_sell_market(
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Sell Market failed: {err}")
+    else:
+        _trade_logger.log_open(result, symbol, "SELL", entry, sl, tp, lot, "ML sell market")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1183,13 +1195,13 @@ def manage_scale_in(
     
     # Throttle Scale-In status log to 30 seconds
     now = _time.time()
-    if not hasattr(manage_scale_in, "_last_status_log"): manage_scale_in._last_status_log = 0
-    if now - manage_scale_in._last_status_log > 30:
+    global _scale_in_last_log_ts
+    if now - _scale_in_last_log_ts > 30:
         print(
             f"⚖️  Scale-In | cap={max_positions} "
             f"({max_total_risk_percent:.0f}% / {risk_percent:.1f}% per trade)"
         )
-        manage_scale_in._last_status_log = now
+        _scale_in_last_log_ts = now
 
     # Dynamic loss threshold from current volatility
     current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
@@ -1367,3 +1379,13 @@ def get_dynamic_trailing_step(symbol: str, timeframe: int, feature_window: int) 
     step = 50 - (ratio - 0.5) * (40.0 / 1.5)
 
     return max(10, min(50, int(step)))
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Expose trade logger for polling from main loop
+# ══════════════════════════════════════════════════════════════════════
+
+def poll_trade_log() -> None:
+    """Call periodically from main loop to flush closed deals to trades.csv."""
+    _trade_logger.poll_closed_deals()

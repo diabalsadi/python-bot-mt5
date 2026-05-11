@@ -1,62 +1,77 @@
 """
-Linear Regression Model
------------------------
-A lightweight single-pass linear regression model that predicts future
-price movement from six technical features including S/R and liquidity zones.
-The algorithm is a direct port of MQL5's TrainLinearModel() / PredictPriceChange()
-extended with multi-timeframe analysis.
+XGBoost Prediction Model
+------------------------
+Replaces the previous hand-rolled linear regression with a proper
+gradient-boosted tree model (XGBoost) and feature standardisation.
 
-MQL5 equivalents (extended):
-  TrainLinearModel()    → LinearRegressionModel.train()
-  PredictPriceChange()  → LinearRegressionModel.predict()
+Why XGBoost over linear regression for gold scalping:
+  - Captures non-linear relationships between features and price movement
+  - Handles correlated features without inflating coefficients
+  - Built-in feature importance for transparency
+  - Regularisation (L1/L2) avoids overfitting on noisy tick data
+
+Interface is identical to the old LinearRegressionModel so main.py
+and strategy.py require no changes.
+
+Requires:
+    pip install xgboost scikit-learn
 """
 
 from __future__ import annotations
 
-import MetaTrader5 as mt5
 import numpy as np
+import MetaTrader5 as mt5
+
+try:
+    import xgboost as xgb
+    from sklearn.preprocessing import StandardScaler
+    _XGB_AVAILABLE = True
+except ImportError:
+    _XGB_AVAILABLE = False
+    print("⚠️  xgboost/scikit-learn not installed — falling back to OLS regression.")
+    print("    Run: pip install xgboost scikit-learn")
 
 from ml.features import get_features
 
 
 class LinearRegressionModel:
     """
-    Extended multivariate linear regression model with 6 features and
-    multi-horizon prediction capability:
+    XGBoost-backed prediction model with StandardScaler normalisation.
 
-        ŷ = β0 + β1·x1 + β2·x2 + β3·x3 + β4·x4 + β5·x5 + β6·x6
+    Falls back to OLS (via np.linalg.lstsq) if xgboost is not installed.
+    Maintains the same public interface as the old LinearRegressionModel
+    so all call-sites in main.py / strategy.py work unchanged.
 
-    where:
-      x1 = momentum
-      x2 = volatility
-      x3 = trend slope
-      x4 = RSI
-      x5 = support/resistance distance (15m)
-      x6 = liquidity zone score (15m)
-    
-    and ŷ is the predicted price change (in points) over the next
-    `prediction_horizon` bars. Supports multiple horizons (e.g., 15 bars
-    ahead = 15 minutes on M1 timeframe).
+    Public attributes kept for backward compatibility:
+        is_trained, beta0..beta6 (mapped to feature importances when using XGB),
+        prediction_horizon
     """
 
     def __init__(self) -> None:
+        # Backward-compat beta attributes (repurposed as feature importances)
         self.beta0: float = 0.0
-        self.beta1: float = 0.0   # momentum coefficient
-        self.beta2: float = 0.0   # volatility coefficient
-        self.beta3: float = 0.0   # trend coefficient
-        self.beta4: float = 0.0   # RSI coefficient
-        self.beta5: float = 0.0   # S/R distance coefficient (15m)
-        self.beta6: float = 0.0   # Liquidity coefficient (15m)
-        self.is_trained: bool = False
-        
-        # Multi-horizon coefficients (for 15m-ahead predictions on M1)
-        self.horizon_models: dict[int, dict[str, float]] = {}  # {horizon: {beta names}}
-        self.prediction_horizon: int = 15  # Default horizon (in bars)
-        self.secondary_horizon: int = 15   # Secondary horizon for lookahead (15 min ahead)
+        self.beta1: float = 0.0
+        self.beta2: float = 0.0
+        self.beta3: float = 0.0
+        self.beta4: float = 0.0
+        self.beta5: float = 0.0
+        self.beta6: float = 0.0
 
-    # ──────────────────────────────────────────────────────────────────
-    # Training
-    # ──────────────────────────────────────────────────────────────────
+        self.is_trained: bool = False
+        self.prediction_horizon: int = 15
+
+        # XGBoost internals
+        self._xgb_model = None
+        self._scaler = None
+
+        # OLS fallback internals
+        self._ols_betas = None
+        self._feature_mean = None
+        self._feature_std = None
+
+        self._use_xgb: bool = _XGB_AVAILABLE
+
+    # ── Training ──────────────────────────────────────────────────────
 
     def train(
         self,
@@ -68,21 +83,13 @@ class LinearRegressionModel:
         rsi_period: int,
     ) -> None:
         """
-        Fit the model coefficients on the most recent `training_bars` candles.
+        Fit the model on the most recent `training_bars` candles.
 
-        The target label y for each training bar i is:
-            y = (close[i - horizon] - close[i]) / point
-        i.e. the actual price movement `prediction_horizon` bars into the future
-        (looking back in the already-recorded history).
-
-        Args:
-            symbol:             Trading symbol
-            timeframe:          MT5 timeframe constant
-            training_bars:      Number of historical bars to train on
-            prediction_horizon: Forward-look in bars (MQL5 MLPredictionHorizon)
-            feature_window:     Feature look-back window (MQL5 MLFeatureWindow)
-            rsi_period:         RSI period for the RSI feature
+        Target label y[i] = (close[i - horizon] - close[i]) / point
+        i.e. actual price movement `prediction_horizon` bars ahead.
         """
+        self.prediction_horizon = prediction_horizon
+
         sym_info = mt5.symbol_info(symbol)
         if sym_info is None:
             print("❌ ML Train: symbol info unavailable")
@@ -90,47 +97,85 @@ class LinearRegressionModel:
 
         point = sym_info.point
         n     = training_bars
-
-        # Fetch enough bars once so individual feature calls can slice locally
         count = n + prediction_horizon + feature_window + rsi_period + 10
         rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
 
         if rates is None or len(rates) < count:
-            print(f"❌ ML Train: need {count} bars, got {0 if rates is None else len(rates)}")
+            got = 0 if rates is None else len(rates)
+            print(f"❌ ML Train: need {count} bars, got {got}")
             return
 
-        closes = rates["close"][::-1]  # index 0 = current bar
+        closes = rates["close"][::-1]   # index 0 = most recent
 
-        # ── Build feature matrix X and target vector y ────────────────
-        rows = []
-        ys = []
+        # ── Build feature matrix X and target y ───────────────────────
+        rows, ys = [], []
         for i in range(prediction_horizon, n + prediction_horizon):
-            x1, x2, x3, x4, x5, x6 = get_features(symbol, timeframe, i, feature_window, rsi_period)
+            x1, x2, x3, x4, x5, x6 = get_features(
+                symbol, timeframe, i, feature_window, rsi_period
+            )
             current_price = closes[i]
             future_price  = closes[i - prediction_horizon]
             y = (future_price - current_price) / point
-            rows.append([1.0, x1, x2, x3, x4, x5, x6])
+            rows.append([x1, x2, x3, x4, x5, x6])
             ys.append(y)
 
         X = np.array(rows, dtype=np.float64)
-        y = np.array(ys,  dtype=np.float64)
+        y = np.array(ys,   dtype=np.float64)
 
-        # ── Joint OLS via least-squares (handles correlated features) ──
-        betas, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-
-        self.beta0 = float(betas[0])
-        self.beta1 = float(betas[1])
-        self.beta2 = float(betas[2])
-        self.beta3 = float(betas[3])
-        self.beta4 = float(betas[4])
-        self.beta5 = float(betas[5])
-        self.beta6 = float(betas[6])
+        if self._use_xgb:
+            self._train_xgb(X, y, point)
+        else:
+            self._train_ols(X, y)
 
         self.is_trained = True
 
-    # ──────────────────────────────────────────────────────────────────
-    # Prediction
-    # ──────────────────────────────────────────────────────────────────
+    def _train_xgb(self, X, y, point) -> None:
+        """Fit XGBRegressor after StandardScaler normalisation."""
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        model = xgb.XGBRegressor(
+            n_estimators=200,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            objective="reg:squarederror",
+            verbosity=0,
+            n_jobs=1,
+        )
+        model.fit(X_scaled, y)
+
+        self._scaler    = scaler
+        self._xgb_model = model
+
+        # Map feature importances to beta slots for the existing logging line
+        fi = model.feature_importances_
+        self.beta0 = 0.0
+        self.beta1, self.beta2, self.beta3 = float(fi[0]), float(fi[1]), float(fi[2])
+        self.beta4, self.beta5, self.beta6 = float(fi[3]), float(fi[4]), float(fi[5])
+
+    def _train_ols(self, X, y) -> None:
+        """Fallback: joint OLS via numpy lstsq with manual standardisation."""
+        mean = X.mean(axis=0)
+        std  = X.std(axis=0)
+        std[std == 0] = 1.0
+        X_norm = (X - mean) / std
+
+        X_aug = np.column_stack([np.ones(len(X_norm)), X_norm])
+        betas, _, _, _ = np.linalg.lstsq(X_aug, y, rcond=None)
+
+        self._ols_betas    = betas
+        self._feature_mean = mean
+        self._feature_std  = std
+
+        self.beta0 = float(betas[0])
+        self.beta1, self.beta2, self.beta3 = float(betas[1]), float(betas[2]), float(betas[3])
+        self.beta4, self.beta5, self.beta6 = float(betas[4]), float(betas[5]), float(betas[6])
+
+    # ── Prediction ────────────────────────────────────────────────────
 
     def predict(
         self,
@@ -140,19 +185,8 @@ class LinearRegressionModel:
         rsi_period: int,
     ) -> float:
         """
-        Predict the expected price change for the current bar in price units.
-
-        Uses shift=1 (last fully closed bar) to avoid look-ahead bias.
-
-        Args:
-            symbol:         Trading symbol
-            timeframe:      MT5 timeframe constant
-            feature_window: Feature window (must match what was used in train)
-            rsi_period:     RSI period (must match train)
-
-        Returns:
-            Predicted price change in price units (not points).
-            Returns 0.0 if the model has not been trained yet.
+        Predict expected price change for the current bar (in price units).
+        Uses current bar features — no look-ahead bias.
         """
         if not self.is_trained:
             return 0.0
@@ -162,19 +196,18 @@ class LinearRegressionModel:
             return 0.0
 
         point = sym_info.point
-        x1, x2, x3, x4, x5, x6 = get_features(symbol, timeframe, 0, feature_window, rsi_period)
+        feats = get_features(symbol, timeframe, 0, feature_window, rsi_period)
+        X = np.array(feats, dtype=np.float64).reshape(1, -1)
 
-        prediction_points = (
-            self.beta0
-            + self.beta1 * x1
-            + self.beta2 * x2
-            + self.beta3 * x3
-            + self.beta4 * x4
-            + self.beta5 * x5
-            + self.beta6 * x6
-        )
+        if self._use_xgb and self._xgb_model is not None:
+            X_scaled = self._scaler.transform(X)
+            pred_pts = float(self._xgb_model.predict(X_scaled)[0])
+        else:
+            X_norm = (X - self._feature_mean) / self._feature_std
+            X_aug  = np.column_stack([np.ones(1), X_norm])
+            pred_pts = float(X_aug @ self._ols_betas)
 
-        return prediction_points * point   # convert points → price units
+        return pred_pts * point
 
     def predict_ahead(
         self,
@@ -185,23 +218,8 @@ class LinearRegressionModel:
         horizon: int = 15,
     ) -> float:
         """
-        Extrapolate predicted price change `horizon` bars ahead.
-
-        Uses only the current bar's features and the trained coefficients —
-        no future OHLCV data is read (which would introduce look-ahead bias).
-        Momentum and trend continue linearly; RSI influence decays with time;
-        volatility and structural features (S/R, liquidity) scale with horizon.
-
-        Args:
-            symbol:         Trading symbol
-            timeframe:      MT5 timeframe constant
-            feature_window: Feature window (must match training)
-            rsi_period:     RSI period (must match training)
-            horizon:        How many bars ahead to predict (default 15)
-
-        Returns:
-            Predicted price change in price units for the horizon.
-            Returns 0.0 if model not trained.
+        Extrapolate prediction `horizon` bars ahead using current features only.
+        No future OHLCV data is read — pure model extrapolation.
         """
         if not self.is_trained:
             return 0.0
@@ -211,34 +229,23 @@ class LinearRegressionModel:
             return 0.0
 
         point = sym_info.point
-
-        x1, x2, x3, x4, x5, x6 = get_features(symbol, timeframe, 0, feature_window, rsi_period)
-
+        feats = get_features(symbol, timeframe, 0, feature_window, rsi_period)
+        X = np.array(feats, dtype=np.float64).reshape(1, -1)
         h_ratio = horizon / max(1, self.prediction_horizon)
 
-        # Trend (x3) scales linearly with horizon; RSI (x4) influence halves;
-        # momentum, vol, S/R, liquidity all scale with h_ratio.
-        prediction_points = (
-            self.beta0 * h_ratio
-            + self.beta1 * x1 * h_ratio        # momentum
-            + self.beta2 * x2 * h_ratio        # volatility
-            + self.beta3 * x3 * h_ratio        # trend (linear continuation)
-            + self.beta4 * x4 * 0.5            # RSI decays
-            + self.beta5 * x5 * h_ratio        # S/R distance
-            + self.beta6 * x6 * h_ratio        # liquidity
-        )
+        if self._use_xgb and self._xgb_model is not None:
+            X_scaled = self._scaler.transform(X)
+            pred_pts = float(self._xgb_model.predict(X_scaled)[0]) * h_ratio
+        else:
+            X_norm = (X - self._feature_mean) / self._feature_std
+            X_aug  = np.column_stack([np.ones(1), X_norm])
+            pred_pts = float(X_aug @ self._ols_betas) * h_ratio
 
-        return prediction_points * point
+        return pred_pts * point
 
-    # ──────────────────────────────────────────────────────────────────
-    # Helpers
-    # ──────────────────────────────────────────────────────────────────
+    # ── Repr ──────────────────────────────────────────────────────────
 
-    def __repr__(self) -> str:  # noqa: D105
-        status = "trained" if self.is_trained else "untrained"
-        return (
-            f"LinearRegressionModel({status}) "
-            f"β=({self.beta0:.4f}, {self.beta1:.4f}, "
-            f"{self.beta2:.4f}, {self.beta3:.4f}, {self.beta4:.4f}, "
-            f"{self.beta5:.4f}, {self.beta6:.4f})"
-        )
+    def __repr__(self) -> str:
+        backend = "XGBoost" if (self._use_xgb and self._xgb_model) else "OLS"
+        status  = "trained" if self.is_trained else "untrained"
+        return f"PredictionModel({backend}, {status})"

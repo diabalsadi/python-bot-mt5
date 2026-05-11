@@ -20,7 +20,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-from actions.connection import initialize_connection
+from actions.connection import initialize_connection, ensure_connected
 from actions.strategy import (
     cancel_all_orders,
     cancel_stale_orders,
@@ -37,6 +37,7 @@ from actions.strategy import (
     manage_reversal_cut_loss,
     trail_sltp,
     check_symbol_trading_status,
+    poll_trade_log,
 )
 from indicators.atr import check_high_volatility
 from indicators.volatility import calculate_volatility
@@ -44,6 +45,8 @@ from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
 from mt5_tool.symbol import get_symbol
 from tools.print import pretty_print
+
+_trade_logger = TradeLogger()  # shared instance for poll_closed_deals
 
 # ──────────────────────────────────────────────────────────────────────
 # Configuration  (mirrors MQL5 input block)
@@ -136,10 +139,18 @@ def on_tick() -> None:
     global last_deletion_ts, last_tick_time_msc, last_logged_bid, last_bar_time
     global _last_status_log_ts, _last_model_log_bar, _last_analysis_ts
 
+    # Reconnection guard — skip tick if MT5 is unreachable
+    if not ensure_connected():
+        return
+
     # Measure tick latency
     t0 = time.perf_counter()
     tick = mt5.symbol_info_tick(SYMBOL)
     app_terminal_speed_ms = int((time.perf_counter() - t0) * 1000)
+
+    # Reconnection guard — bail out if MT5 terminal is not reachable
+    if not ensure_connected():
+        return
 
     if tick is not None and tick.time_msc != last_tick_time_msc:
         last_tick_time_msc = tick.time_msc
@@ -428,6 +439,12 @@ def on_tick() -> None:
         RSI_PERIOD,
         model,
     )
+
+    # Flush any closed deals to trades.csv
+    poll_trade_log()
+
+    # 8. Poll for newly closed trades and log them to CSV
+    _trade_logger.poll_closed_deals()
 
 
 def main() -> None:

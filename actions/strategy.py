@@ -44,10 +44,19 @@ def calculate_lot_size(symbol: str, sl_points: int, risk_percent: float) -> floa
 
     MQL5 equivalent: CalculateLotSize()
     """
-    balance = mt5.account_info().balance
+    account = mt5.account_info()
+    if account is None:
+        print("❌ calculate_lot_size: account_info unavailable — returning min lot")
+        sym = mt5.symbol_info(symbol)
+        return sym.volume_min if sym else 0.01
+
+    balance = account.balance
     risk_amt = balance * risk_percent / 100.0
 
     sym = mt5.symbol_info(symbol)
+    if sym is None:
+        print("❌ calculate_lot_size: symbol_info unavailable — returning 0.01")
+        return 0.01
     tick_value = sym.trade_tick_value
     tick_size = sym.trade_tick_size
 
@@ -322,7 +331,8 @@ def trail_sltp(
         effective_dist = max(effective_dist, min_dist)
         
         # ── CALCULATE TARGETS ────────────────────────────────────────
-        if stage != "Stage 1 (Break-even)":
+        # Stage 1 already computed target_sl directly; all other stages derive it from price
+        if stage != "Stage 1 (50% Reserve)":
             if pos.type == mt5.POSITION_TYPE_BUY:
                 target_sl = round(price - effective_dist, digits)
             else:
@@ -1276,19 +1286,19 @@ def manage_reversal_cut_loss(
                     f"\U0001f6d1 Cut-Loss: closing BUY #{pos.ticket} "
                     f"— market shifted bearish (pred={prediction:.5f}) & loss={loss_pct:.1%}"
                 )
-            mt5.order_send(
-                {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "position": pos.ticket,
-                    "symbol": symbol,
-                    "volume": pos.volume,
-                    "type": mt5.ORDER_TYPE_SELL,
-                    "price": tick.bid,
-                    "deviation": 20,
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
-            )
+                mt5.order_send(
+                    {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "position": pos.ticket,
+                        "symbol": symbol,
+                        "volume": pos.volume,
+                        "type": mt5.ORDER_TYPE_SELL,
+                        "price": tick.bid,
+                        "deviation": 20,
+                        "type_time": mt5.ORDER_TIME_GTC,
+                        "type_filling": mt5.ORDER_FILLING_IOC,
+                    }
+                )
 
         elif pos.type == mt5.POSITION_TYPE_SELL and prediction > 0:
             if loss_pct >= loss_threshold_pct:
@@ -1296,19 +1306,19 @@ def manage_reversal_cut_loss(
                     f"\U0001f6d1 Cut-Loss: closing SELL #{pos.ticket} "
                     f"— market shifted bullish (pred={prediction:.5f}) & loss={loss_pct:.1%}"
                 )
-            mt5.order_send(
-                {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "position": pos.ticket,
-                    "symbol": symbol,
-                    "volume": pos.volume,
-                    "type": mt5.ORDER_TYPE_BUY,
-                    "price": tick.ask,
-                    "deviation": 20,
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
-            )
+                mt5.order_send(
+                    {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "position": pos.ticket,
+                        "symbol": symbol,
+                        "volume": pos.volume,
+                        "type": mt5.ORDER_TYPE_BUY,
+                        "price": tick.ask,
+                        "deviation": 20,
+                        "type_time": mt5.ORDER_TIME_GTC,
+                        "type_filling": mt5.ORDER_FILLING_IOC,
+                    }
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════

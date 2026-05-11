@@ -37,13 +37,12 @@ from actions.strategy import (
     manage_reversal_cut_loss,
     trail_sltp,
     check_symbol_trading_status,
-    get_dynamic_trailing_step,
 )
 from indicators.atr import check_high_volatility
 from indicators.volatility import calculate_volatility
 from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
-from mt5_tool.symbol import get_symbol, stream_ticks
+from mt5_tool.symbol import get_symbol
 from tools.print import pretty_print
 
 # ──────────────────────────────────────────────────────────────────────
@@ -119,19 +118,44 @@ last_tick_time_msc = 0
 last_bar_time = 0
 last_logged_bid = 0.0
 
+# Throttle timestamps (replaces function-attribute hacks)
+_last_status_log_ts = 0.0
+_last_model_log_bar = 0
+_last_analysis_ts = 0.0
+
 # ──────────────────────────────────────────────────────────────────────
-# Helpers
+# Daily drawdown circuit breaker
 # ──────────────────────────────────────────────────────────────────────
+MAX_DAILY_LOSS_PERCENT = 5.0   # shut down if day's loss exceeds 5% of balance
+_day_start_balance: float = 0.0
+_bot_halted: bool = False
 
 
-def _bars_available() -> int:
-    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)
-    if rates is None:
-        return 0
-    return int(
-        mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 5000).shape[0]
-    )  # approximate
+def _check_daily_drawdown() -> bool:
+    """Return True (halt) if today's loss has exceeded MAX_DAILY_LOSS_PERCENT."""
+    global _day_start_balance, _bot_halted
 
+    if _bot_halted:
+        return True
+
+    account = mt5.account_info()
+    if account is None:
+        return False
+
+    if _day_start_balance == 0.0:
+        _day_start_balance = account.balance
+        return False
+
+    loss_pct = (_day_start_balance - account.equity) / _day_start_balance * 100.0
+    if loss_pct >= MAX_DAILY_LOSS_PERCENT:
+        print(
+            f"🛑 DAILY DRAWDOWN LIMIT HIT ({loss_pct:.2f}% >= {MAX_DAILY_LOSS_PERCENT}%) "
+            "— bot halted for the rest of the session."
+        )
+        _bot_halted = True
+        return True
+
+    return False
 
 # ──────────────────────────────────────────────────────────────────────
 # Main loop
@@ -140,12 +164,18 @@ def _bars_available() -> int:
 
 def on_tick() -> None:
     """Called on every price tick — mirrors MQL5 OnTick()."""
-    global total_bars, ml_train_counter, mid_train_counter, long_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid, last_bar_time
+    global total_bars, ml_train_counter, mid_train_counter, long_train_counter
+    global last_deletion_ts, last_tick_time_msc, last_logged_bid, last_bar_time
+    global _last_status_log_ts, _last_model_log_bar, _last_analysis_ts
 
     # Measure tick latency
     t0 = time.perf_counter()
     tick = mt5.symbol_info_tick(SYMBOL)
     app_terminal_speed_ms = int((time.perf_counter() - t0) * 1000)
+
+    # Daily drawdown guard (highest priority — check before anything else)
+    if _check_daily_drawdown():
+        return
 
     if tick is not None and tick.time_msc != last_tick_time_msc:
         last_tick_time_msc = tick.time_msc
@@ -153,13 +183,10 @@ def on_tick() -> None:
         # 0. Market Status Guard
         is_open, status_msg = check_symbol_trading_status(SYMBOL)
         if not is_open:
-            # Log once every 30 seconds to avoid spam
             now = time.time()
-            if not hasattr(on_tick, "_last_status_log"):
-                on_tick._last_status_log = 0
-            if now - on_tick._last_status_log > 30:
+            if now - _last_status_log_ts > 30:
                 print(f"⚠️  PAUSED (Market Status: {status_msg})")
-                on_tick._last_status_log = now
+                _last_status_log_ts = now
             return
 
         if abs(tick.bid - last_logged_bid) >= 1.0:
@@ -172,19 +199,14 @@ def on_tick() -> None:
                 f"PRICE UPDATE | {SYMBOL} Bid: {tick.bid:.5f} Ask: {tick.ask:.5f} | "
                 f"Step: {TRAILING_STEP_POINTS} | Broker: {broker_ping_ms}ms | App: {app_terminal_speed_ms}ms"
             )
-            if model.is_trained:
-                # Only print weights once per training cycle
-                if (
-                    not hasattr(on_tick, "_last_model_time")
-                    or on_tick._last_model_time != last_bar_time
-                ):
-                    print(
-                        f"🤖 ML Model Updated | "
-                        f"β0={model.beta0:.4f}  β1={model.beta1:.4f}  "
-                        f"β2={model.beta2:.4f}  β3={model.beta3:.4f}  β4={model.beta4:.4f}  "
-                        f"β5={model.beta5:.4f}  β6={model.beta6:.4f}"
-                    )
-                    on_tick._last_model_time = last_bar_time
+            if model.is_trained and _last_model_log_bar != last_bar_time:
+                print(
+                    f"🤖 ML Model Updated | "
+                    f"β0={model.beta0:.4f}  β1={model.beta1:.4f}  "
+                    f"β2={model.beta2:.4f}  β3={model.beta3:.4f}  β4={model.beta4:.4f}  "
+                    f"β5={model.beta5:.4f}  β6={model.beta6:.4f}"
+                )
+                _last_model_log_bar = last_bar_time
 
     # 1. US open protection (highest priority)
     if USE_US_OPEN_PROTECTION and check_us_session_exclusion(
@@ -255,9 +277,7 @@ def on_tick() -> None:
 
     # 6a.5 Analysis & Signal Logs (Throttled to reduce noise)
     now_ts = time.time()
-    if not hasattr(on_tick, "_last_analysis_ts"):
-        on_tick._last_analysis_ts = 0
-    show_analysis = (now_ts - on_tick._last_analysis_ts > 30) or (
+    show_analysis = (now_ts - _last_analysis_ts > 30) or (
         abs(tick.bid - last_logged_bid) >= 5.0
     )
 
@@ -296,8 +316,7 @@ def on_tick() -> None:
             f"ML Short: {prediction:+.5f} | Mid: {mid_prediction:+.5f} | Long: {long_prediction:+.5f} ({status_h1}) | "
             f"Confirmed: {confirmed_prediction:+.5f} | Target: {predicted_price:.5f}"
         )
-        on_tick._last_analysis_ts = now_ts
-
+        _last_analysis_ts = now_ts
     # 6b. Get ML entry levels (Synchronized with confirmed prediction)
     buy_level, sell_level = get_ml_entry_levels(
         SYMBOL,

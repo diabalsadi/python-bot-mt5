@@ -101,56 +101,30 @@ class LinearRegressionModel:
 
         closes = rates["close"][::-1]  # index 0 = current bar
 
-        # ── Accumulators ──────────────────────────────────────────────
-        sum_x1 = sum_x2 = sum_x3 = sum_x4 = sum_x5 = sum_x6 = 0.0
-        sum_y  = 0.0
-        sum_x1y = sum_x2y = sum_x3y = sum_x4y = sum_x5y = sum_x6y = 0.0
-        sum_x1_2 = sum_x2_2 = sum_x3_2 = sum_x4_2 = sum_x5_2 = sum_x6_2 = 0.0
-
+        # ── Build feature matrix X and target vector y ────────────────
+        rows = []
+        ys = []
         for i in range(prediction_horizon, n + prediction_horizon):
             x1, x2, x3, x4, x5, x6 = get_features(symbol, timeframe, i, feature_window, rsi_period)
-
             current_price = closes[i]
-            future_price  = closes[i - prediction_horizon]   # closer to "now"
+            future_price  = closes[i - prediction_horizon]
             y = (future_price - current_price) / point
+            rows.append([1.0, x1, x2, x3, x4, x5, x6])
+            ys.append(y)
 
-            sum_x1 += x1;   sum_x2 += x2;   sum_x3 += x3;   sum_x4 += x4
-            sum_x5 += x5;   sum_x6 += x6
-            sum_y  += y
+        X = np.array(rows, dtype=np.float64)
+        y = np.array(ys,  dtype=np.float64)
 
-            sum_x1y  += x1 * y;  sum_x2y  += x2 * y
-            sum_x3y  += x3 * y;  sum_x4y  += x4 * y
-            sum_x5y  += x5 * y;  sum_x6y  += x6 * y
+        # ── Joint OLS via least-squares (handles correlated features) ──
+        betas, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
 
-            sum_x1_2 += x1 * x1; sum_x2_2 += x2 * x2
-            sum_x3_2 += x3 * x3; sum_x4_2 += x4 * x4
-            sum_x5_2 += x5 * x5; sum_x6_2 += x6 * x6
-
-        # ── OLS (univariate, per feature) ─────────────────────────────
-        avg_x1 = sum_x1 / n;  avg_x2 = sum_x2 / n
-        avg_x3 = sum_x3 / n;  avg_x4 = sum_x4 / n
-        avg_x5 = sum_x5 / n;  avg_x6 = sum_x6 / n
-        avg_y  = sum_y  / n
-
-        var_x1 = (sum_x1_2 / n) - avg_x1 ** 2
-        var_x2 = (sum_x2_2 / n) - avg_x2 ** 2
-        var_x3 = (sum_x3_2 / n) - avg_x3 ** 2
-        var_x4 = (sum_x4_2 / n) - avg_x4 ** 2
-        var_x5 = (sum_x5_2 / n) - avg_x5 ** 2
-        var_x6 = (sum_x6_2 / n) - avg_x6 ** 2
-
-        self.beta1 = ((sum_x1y / n) - avg_x1 * avg_y) / var_x1 if var_x1 else 0.0
-        self.beta2 = ((sum_x2y / n) - avg_x2 * avg_y) / var_x2 if var_x2 else 0.0
-        self.beta3 = ((sum_x3y / n) - avg_x3 * avg_y) / var_x3 if var_x3 else 0.0
-        self.beta4 = ((sum_x4y / n) - avg_x4 * avg_y) / var_x4 if var_x4 else 0.0
-        self.beta5 = ((sum_x5y / n) - avg_x5 * avg_y) / var_x5 if var_x5 else 0.0
-        self.beta6 = ((sum_x6y / n) - avg_x6 * avg_y) / var_x6 if var_x6 else 0.0
-
-        self.beta0 = avg_y - (
-            self.beta1 * avg_x1 + self.beta2 * avg_x2 +
-            self.beta3 * avg_x3 + self.beta4 * avg_x4 +
-            self.beta5 * avg_x5 + self.beta6 * avg_x6
-        )
+        self.beta0 = float(betas[0])
+        self.beta1 = float(betas[1])
+        self.beta2 = float(betas[2])
+        self.beta3 = float(betas[3])
+        self.beta4 = float(betas[4])
+        self.beta5 = float(betas[5])
+        self.beta6 = float(betas[6])
 
         self.is_trained = True
 
@@ -211,21 +185,20 @@ class LinearRegressionModel:
         horizon: int = 15,
     ) -> float:
         """
-        Predict price change further into the future (e.g., 15 bars = 15 min on M1).
-        
-        Uses the current model coefficients but assumes similar feature dynamics
-        will persist. This is useful for:
-          - Identifying target levels 15 minutes ahead
-          - Deciding trade direction based on multi-timeframe confirmation
-          - Setting profit targets based on lookahead consensus
-        
+        Extrapolate predicted price change `horizon` bars ahead.
+
+        Uses only the current bar's features and the trained coefficients —
+        no future OHLCV data is read (which would introduce look-ahead bias).
+        Momentum and trend continue linearly; RSI influence decays with time;
+        volatility and structural features (S/R, liquidity) scale with horizon.
+
         Args:
             symbol:         Trading symbol
             timeframe:      MT5 timeframe constant
             feature_window: Feature window (must match training)
             rsi_period:     RSI period (must match training)
-            horizon:        How many bars ahead to predict (default 15 = 15 min on M1)
-        
+            horizon:        How many bars ahead to predict (default 15)
+
         Returns:
             Predicted price change in price units for the horizon.
             Returns 0.0 if model not trained.
@@ -238,31 +211,21 @@ class LinearRegressionModel:
             return 0.0
 
         point = sym_info.point
-        
-        # Look ahead by fetching features at future bar positions
-        # This is an extrapolation based on trend continuation
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, horizon + feature_window + 5)
-        if rates is None or len(rates) < horizon + feature_window:
-            return 0.0
 
-        closes = rates["close"][::-1]
-        
-        # Current price and projected future price
-        current_price = float(closes[0])
-        future_price = float(closes[horizon])
-        
-        # Get features from the current bar (as a proxy for trend continuation)
         x1, x2, x3, x4, x5, x6 = get_features(symbol, timeframe, 0, feature_window, rsi_period)
-        
-        # Apply model with current features to extrapolate
+
+        h_ratio = horizon / max(1, self.prediction_horizon)
+
+        # Trend (x3) scales linearly with horizon; RSI (x4) influence halves;
+        # momentum, vol, S/R, liquidity all scale with h_ratio.
         prediction_points = (
-            self.beta0 * (horizon / self.prediction_horizon)  # Scale intercept
-            + self.beta1 * x1 * (horizon / self.prediction_horizon)
-            + self.beta2 * x2 * (horizon / self.prediction_horizon)
-            + self.beta3 * x3  # Trend continues linearly
-            + self.beta4 * x4 * 0.5  # RSI influence diminishes
-            + self.beta5 * x5 * (horizon / self.prediction_horizon)
-            + self.beta6 * x6 * (horizon / self.prediction_horizon)
+            self.beta0 * h_ratio
+            + self.beta1 * x1 * h_ratio        # momentum
+            + self.beta2 * x2 * h_ratio        # volatility
+            + self.beta3 * x3 * h_ratio        # trend (linear continuation)
+            + self.beta4 * x4 * 0.5            # RSI decays
+            + self.beta5 * x5 * h_ratio        # S/R distance
+            + self.beta6 * x6 * h_ratio        # liquidity
         )
 
         return prediction_points * point

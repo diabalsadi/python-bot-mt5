@@ -12,9 +12,9 @@ PASSWORD = os.getenv("PASSWORD")
 SERVER = os.getenv("SERVER")
 
 print(f"MT5 Path: {MT5_PATH}")
-print(f"Login: {LOGIN}")
-print(f"Password: {PASSWORD}")
-print(f"Server: {SERVER}")
+print(f"Login:    {LOGIN}")
+print(f"Server:   {SERVER}")
+# Password intentionally not printed
 
 
 def initialize_connection():

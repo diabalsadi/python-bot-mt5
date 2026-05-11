@@ -45,6 +45,7 @@ from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
 from mt5_tool.symbol import get_symbol
 from tools.print import pretty_print
+from tools.trade_logger import TradeLogger
 
 _trade_logger = TradeLogger()  # shared instance for poll_closed_deals
 

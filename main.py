@@ -123,39 +123,7 @@ _last_status_log_ts = 0.0
 _last_model_log_bar = 0
 _last_analysis_ts = 0.0
 
-# ──────────────────────────────────────────────────────────────────────
-# Daily drawdown circuit breaker
-# ──────────────────────────────────────────────────────────────────────
-MAX_DAILY_LOSS_PERCENT = 5.0   # shut down if day's loss exceeds 5% of balance
-_day_start_balance: float = 0.0
-_bot_halted: bool = False
 
-
-def _check_daily_drawdown() -> bool:
-    """Return True (halt) if today's loss has exceeded MAX_DAILY_LOSS_PERCENT."""
-    global _day_start_balance, _bot_halted
-
-    if _bot_halted:
-        return True
-
-    account = mt5.account_info()
-    if account is None:
-        return False
-
-    if _day_start_balance == 0.0:
-        _day_start_balance = account.balance
-        return False
-
-    loss_pct = (_day_start_balance - account.equity) / _day_start_balance * 100.0
-    if loss_pct >= MAX_DAILY_LOSS_PERCENT:
-        print(
-            f"🛑 DAILY DRAWDOWN LIMIT HIT ({loss_pct:.2f}% >= {MAX_DAILY_LOSS_PERCENT}%) "
-            "— bot halted for the rest of the session."
-        )
-        _bot_halted = True
-        return True
-
-    return False
 
 # ──────────────────────────────────────────────────────────────────────
 # Main loop
@@ -172,10 +140,6 @@ def on_tick() -> None:
     t0 = time.perf_counter()
     tick = mt5.symbol_info_tick(SYMBOL)
     app_terminal_speed_ms = int((time.perf_counter() - t0) * 1000)
-
-    # Daily drawdown guard (highest priority — check before anything else)
-    if _check_daily_drawdown():
-        return
 
     if tick is not None and tick.time_msc != last_tick_time_msc:
         last_tick_time_msc = tick.time_msc

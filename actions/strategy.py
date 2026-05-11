@@ -32,7 +32,12 @@ from indicators.trend import get_technical_trend
 from ml.model import LinearRegressionModel
 from tools.trade_logger import TradeLogger
 
-_trade_logger = TradeLogger()
+_trade_logger = TradeLogger()   # on_close callback set by main.py via set_trade_logger_callback()
+
+
+def set_trade_logger_callback(cb) -> None:
+    """Called from main.py to register the consecutive-loss circuit breaker."""
+    _trade_logger._on_close = cb
 
 # Module-level state (replaces function-attribute hacks)
 _trail_debug_cnt: dict[int, int] = {}
@@ -1210,17 +1215,25 @@ def manage_scale_in(
     prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
 
     # ── BUY positions ─────────────────────────────────────────────────
+    max_adverse_pts = sl_points_default * 2.0  # same ceiling as SELL block
+
     if buy_positions and len(buy_positions) < max_positions and prediction > 0:
         for pos in buy_positions:
             profit_points = (tick.bid - pos.price_open) / point
-            
+
+            # SAFETY: never scale in beyond 2× SL distance
+            adverse_pts = -profit_points
+            if adverse_pts >= max_adverse_pts:
+                print(
+                    f"🛑 Scale-In BLOCKED #{pos.ticket}: adverse move {adverse_pts:.1f} pts "
+                    f">= ceiling {max_adverse_pts:.0f} pts"
+                )
+                break
+
             # Case A: Averaging Down (Scale-In)
             if profit_points < -loss_threshold_pts:
                 print(f"📉 Scale-In BUY #{pos.ticket} losing {-profit_points:.1f} pts — trend still UP")
-                new_sl = round(tick.bid - sl_points_default * point * 1.5, sym.digits)
-                if pos.sl == 0 or new_sl < pos.sl:
-                    mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": pos.ticket, "symbol": symbol, "sl": new_sl, "tp": pos.tp})
-                
+                # Do NOT widen the original SL
                 execute_buy_market(symbol, timeframe, sl_points_default, feature_window, rsi_period, risk_percent, model, allow_multiple=True)
                 _scale_in_last_time[symbol] = _time.time()
                 break
@@ -1233,21 +1246,33 @@ def manage_scale_in(
                 break
 
     # ── SELL positions ────────────────────────────────────────────────
+    # Hard ceiling: never scale in if any existing SELL is losing more than
+    # 2× the default SL distance.  This prevents runaway averaging-down
+    # during a trend surge (e.g. the $13 XAUUSDm bull move scenario).
+    MAX_ADVERSE_SCALE_MULTIPLIER = 2.0
+    max_adverse_pts = sl_points_default * MAX_ADVERSE_SCALE_MULTIPLIER
+
     if sell_positions and len(sell_positions) < max_positions and prediction < 0:
         for pos in sell_positions:
             profit_points = (pos.price_open - tick.ask) / point
-            
-            # Case A: Averaging Down (Scale-In)
+
+            # SAFETY: if adverse move exceeds hard ceiling, skip ALL scale-in
+            adverse_pts = -profit_points  # positive = losing
+            if adverse_pts >= max_adverse_pts:
+                print(
+                    f"🛑 Scale-In BLOCKED #{pos.ticket}: adverse move {adverse_pts:.1f} pts "
+                    f">= ceiling {max_adverse_pts:.0f} pts — not averaging into a trend move"
+                )
+                break
+
+            # Case A: Averaging Down (Scale-In) — only within the safe zone
             if profit_points < -loss_threshold_pts:
                 print(f"📈 Scale-In SELL #{pos.ticket} losing {-profit_points:.1f} pts — trend still DOWN")
-                new_sl = round(tick.ask + sl_points_default * point * 1.5, sym.digits)
-                if pos.sl == 0 or new_sl > pos.sl:
-                    mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": pos.ticket, "symbol": symbol, "sl": new_sl, "tp": pos.tp})
-                
+                # Do NOT widen the original SL — let each position stand on its own
                 execute_sell_market(symbol, timeframe, sl_points_default, feature_window, rsi_period, risk_percent, model, allow_multiple=True)
                 _scale_in_last_time[symbol] = _time.time()
                 break
-            
+
             # Case B: Pyramiding (Scaling Up)
             elif profit_points > current_vol * 1.5 and abs(prediction) > current_vol * 0.8:
                 print(f"🚀 Pyramiding SELL #{pos.ticket} profiting {profit_points:.1f} pts — trend is STRONG")

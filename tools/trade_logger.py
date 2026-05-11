@@ -39,16 +39,31 @@ _HEADERS = [
 
 class TradeLogger:
     """
-    Logs trade opens immediately after order_send succeeds, and
-    periodically scans MT5 deal history to log closes.
+    XGBoost-backed prediction model with StandardScaler normalisation.
+
+    Falls back to OLS (via np.linalg.lstsq) if xgboost is not installed.
+    Maintains the same public interface as the old LinearRegressionModel
+    so all call-sites in main.py / strategy.py work unchanged.
+
+    Public attributes kept for backward compatibility:
+        is_trained, beta0..beta6 (mapped to feature importances when using XGB),
+        prediction_horizon
     """
 
-    def __init__(self, csv_path: str = CSV_PATH) -> None:
+    def __init__(self, csv_path: str = CSV_PATH, on_close=None) -> None:
+        """
+        Args:
+            csv_path: Path to the output CSV file.
+            on_close: Optional callback(direction: str, profit: float) called
+                      after every position close. Used by main.py to feed the
+                      consecutive-loss circuit breaker.
+        """
         self.csv_path = csv_path
-        self._open_trades: dict[int, dict] = {}   # ticket -> open trade data
+        self._on_close = on_close  # callback(direction, profit)
+        self._open_trades: dict[int, dict] = {}
         self._last_poll_ts: float = 0.0
-        self._poll_interval: float = 30.0          # seconds between close-checks
-        self._last_deal_ts: int = int(time.time()) # epoch of last seen deal
+        self._poll_interval: float = 30.0
+        self._last_deal_ts: int = int(time.time())
 
         self._ensure_header()
 
@@ -162,6 +177,13 @@ class TradeLogger:
             f"{direction} {deal.symbol} | P&L: ${deal.profit:+.2f} "
             f"({profit_pips:+.1f} pips) | {duration_mins} min"
         )
+
+        # Notify caller (e.g. consecutive-loss circuit breaker in main.py)
+        if self._on_close is not None:
+            try:
+                self._on_close(direction, deal.profit)
+            except Exception as e:
+                print(f"⚠️  TradeLogger on_close callback error: {e}")
 
     def _ensure_header(self) -> None:
         if not os.path.exists(self.csv_path):

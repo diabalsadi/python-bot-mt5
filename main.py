@@ -38,6 +38,7 @@ from actions.strategy import (
     trail_sltp,
     check_symbol_trading_status,
     poll_trade_log,
+    set_trade_logger_callback,
 )
 from indicators.atr import check_high_volatility
 from indicators.volatility import calculate_volatility
@@ -45,8 +46,6 @@ from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
 from mt5_tool.symbol import get_symbol
 from tools.print import pretty_print
-
-_trade_logger = TradeLogger()  # shared instance for poll_closed_deals
 
 # ──────────────────────────────────────────────────────────────────────
 # Configuration  (mirrors MQL5 input block)
@@ -125,6 +124,90 @@ last_logged_bid = 0.0
 _last_status_log_ts = 0.0
 _last_model_log_bar = 0
 _last_analysis_ts = 0.0
+
+# ── Consecutive loss circuit breaker ──────────────────────────────────
+# If the bot takes MAX_CONSECUTIVE_LOSSES losses in the same direction
+# without a win, it pauses that direction for LOSS_PAUSE_SECONDS.
+MAX_CONSECUTIVE_LOSSES = 3
+LOSS_PAUSE_SECONDS     = 300   # 5 minutes
+
+_consecutive_sell_losses = 0
+_consecutive_buy_losses  = 0
+_sell_paused_until: float = 0.0
+_buy_paused_until:  float = 0.0
+_last_logged_direction: str = ""
+
+
+def _record_trade_outcome(direction: str, profit: float) -> None:
+    """Call after a position closes to update the loss counter."""
+    global _consecutive_sell_losses, _consecutive_buy_losses
+    global _sell_paused_until, _buy_paused_until
+
+    if direction == "SELL":
+        if profit < 0:
+            _consecutive_sell_losses += 1
+            if _consecutive_sell_losses >= MAX_CONSECUTIVE_LOSSES:
+                _sell_paused_until = time.time() + LOSS_PAUSE_SECONDS
+                print(
+                    f"⏸  SELL paused for {LOSS_PAUSE_SECONDS}s after "
+                    f"{_consecutive_sell_losses} consecutive losses"
+                )
+        else:
+            _consecutive_sell_losses = 0
+    else:
+        if profit < 0:
+            _consecutive_buy_losses += 1
+            if _consecutive_buy_losses >= MAX_CONSECUTIVE_LOSSES:
+                _buy_paused_until = time.time() + LOSS_PAUSE_SECONDS
+                print(
+                    f"⏸  BUY paused for {LOSS_PAUSE_SECONDS}s after "
+                    f"{_consecutive_buy_losses} consecutive losses"
+                )
+        else:
+            _consecutive_buy_losses = 0
+
+
+def _is_strong_trend_against(direction: str, symbol: str, timeframe: int, n_bars: int = 5) -> bool:
+    """
+    Return True if the last `n_bars` M1 candles show a strong directional move
+    that is AGAINST the proposed entry direction.
+
+    Logic:
+      - Compute the net move over the last n_bars candles.
+      - If proposing SELL but price has moved up by > 1× ATR → strong uptrend → block.
+      - If proposing BUY  but price has moved dn by > 1× ATR → strong downtrend → block.
+
+    This prevents the bot from entering counter-trend during a surge.
+    """
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, n_bars + 14)
+    if rates is None or len(rates) < n_bars + 1:
+        return False
+
+    closes = rates["close"]
+    highs  = rates["high"]
+    lows   = rates["low"]
+
+    # ATR(14) on the fetched window
+    trs = []
+    for i in range(1, len(rates)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]),
+        )
+        trs.append(tr)
+    atr = sum(trs[-14:]) / 14 if len(trs) >= 14 else sum(trs) / max(len(trs), 1)
+
+    net_move = closes[-1] - closes[-n_bars]   # positive = price moved up
+
+    if direction == "SELL" and net_move > atr:
+        print(f"🚫 Trend gate: SELL blocked — last {n_bars} bars moved UP {net_move:.3f} (ATR={atr:.3f})")
+        return True
+    if direction == "BUY"  and net_move < -atr:
+        print(f"🚫 Trend gate: BUY blocked — last {n_bars} bars moved DN {-net_move:.3f} (ATR={atr:.3f})")
+        return True
+
+    return False
 
 
 
@@ -369,8 +452,19 @@ def on_tick() -> None:
             SR_LOOKBACK_BARS,
         )
 
-    # 6d. Place new orders
-    if buy_level > 0:
+    # 6d. Place new orders — guarded by trend gate + consecutive loss pause
+    now_ts_entry = time.time()
+
+    sell_allowed = (
+        now_ts_entry > _sell_paused_until
+        and not _is_strong_trend_against("SELL", SYMBOL, TIMEFRAME)
+    )
+    buy_allowed = (
+        now_ts_entry > _buy_paused_until
+        and not _is_strong_trend_against("BUY", SYMBOL, TIMEFRAME)
+    )
+
+    if buy_level > 0 and buy_allowed:
         execute_buy_market(
             SYMBOL,
             TIMEFRAME,
@@ -381,7 +475,7 @@ def on_tick() -> None:
             model,
         )
 
-    if sell_level > 0:
+    if sell_level > 0 and sell_allowed:
         execute_sell_market(
             SYMBOL,
             TIMEFRAME,
@@ -451,6 +545,7 @@ def main() -> None:
     global model
 
     initialize_connection()
+    set_trade_logger_callback(_record_trade_outcome)  # wire consecutive-loss breaker
     pretty_print(mt5.account_info(), "Account Info")
 
     symbol = get_symbol(SYMBOL)

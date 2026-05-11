@@ -40,6 +40,7 @@ from actions.strategy import (
     get_dynamic_trailing_step,
 )
 from indicators.atr import check_high_volatility
+from indicators.volatility import calculate_volatility
 from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
 from mt5_tool.symbol import get_symbol, stream_ticks
@@ -52,10 +53,15 @@ SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSDm")
 TIMEFRAME = mt5.TIMEFRAME_M1
 
 # ML — short-term model (M1, last 150 bars for fast adaptation)
-ML_TRAINING_BARS = 150
+ML_TRAINING_BARS = 1440  # 24 hour of m1 candles
 ML_FEATURE_WINDOW = 12
 ML_RETRAIN_INTERVAL = 10  # bars between retrains
 ML_PREDICTION_HORIZON = 15
+
+# ML — medium-term model (M15, last 1200 bars = ~12 days)
+MID_TIMEFRAME = mt5.TIMEFRAME_M15
+MID_TRAINING_BARS = 1200  
+MID_RETRAIN_INTERVAL = 45  # retrain mid model every 45 short ticks
 
 # ML — long-term trend model (H1, ~3 months = 2160 bars)
 LONG_TIMEFRAME = mt5.TIMEFRAME_H1
@@ -66,12 +72,12 @@ LONG_RETRAIN_INTERVAL = 60  # retrain long model every 60 short ticks
 RSI_PERIOD = 14
 EMA_PERIOD = 50
 ATR_PERIOD = 14
-TREND_BARS = 5
+TREND_BARS = 15
 
 # Risk / order management
 SL_POINTS = 2000
 RISK_PERCENT = 10.0
-TRAILING_STEP_POINTS = 50
+TRAILING_STEP_POINTS = 300
 EXPIRATION_HOURS = 50
 MIN_ORDER_DISTANCE_PTS = 500
 RESET_ORDERS_INTERVAL = 30  # minutes
@@ -102,9 +108,11 @@ SR_LOOKBACK_BARS = 50  # Bars used to detect S/R levels
 # State
 # ──────────────────────────────────────────────────────────────────────
 model = LinearRegressionModel()  # short-term M1 model
+mid_model = LinearRegressionModel()  # medium-term M5 model
 long_model = LinearRegressionModel()  # long-term H1 model (3 months)
 total_bars = 0
 ml_train_counter = 0
+mid_train_counter = 0
 long_train_counter = 0
 last_deletion_ts = 0.0
 last_tick_time_msc = 0
@@ -132,7 +140,7 @@ def _bars_available() -> int:
 
 def on_tick() -> None:
     """Called on every price tick — mirrors MQL5 OnTick()."""
-    global total_bars, ml_train_counter, long_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid, last_bar_time
+    global total_bars, ml_train_counter, mid_train_counter, long_train_counter, last_deletion_ts, last_tick_time_msc, last_logged_bid, last_bar_time
 
     # Measure tick latency
     t0 = time.perf_counter()
@@ -226,7 +234,13 @@ def on_tick() -> None:
             )
             last_bar_time = this_bar_time
 
-    # 6a.1 Long-term trend model retraining (H1, ~3 months, less frequent)
+    # 6a.1 Medium-term model retraining (M15)
+    mid_train_counter += 1
+    if mid_train_counter >= MID_RETRAIN_INTERVAL or not mid_model.is_trained:
+        mid_model.train(SYMBOL, MID_TIMEFRAME, MID_TRAINING_BARS, ML_PREDICTION_HORIZON, ML_FEATURE_WINDOW, RSI_PERIOD)
+        mid_train_counter = 0
+
+    # 6a.2 Long-term trend model retraining (H1, ~3 months, less frequent)
     long_train_counter += 1
     if long_train_counter >= LONG_RETRAIN_INTERVAL or not long_model.is_trained:
         long_model.train(
@@ -255,21 +269,31 @@ def on_tick() -> None:
             f"📊 15M Lookahead | Target: {target_15m:.5f} | Direction: {direction_15m}"
         )
 
-    # 6c. Predictions: short-term (M1) + long-term (H1) combined signal
+    # 6c. Predictions: short-term (M1) + medium-term (M15) + long-term (H1) combined signal
     prediction = model.predict(SYMBOL, TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
+    mid_prediction = mid_model.predict(SYMBOL, MID_TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD)
     long_prediction = long_model.predict(
         SYMBOL, LONG_TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD
     )
-    # Both models must agree on direction; otherwise signal is neutral
-    same_direction = (prediction > 0 and long_prediction > 0) or (
-        prediction < 0 and long_prediction < 0
-    )
+
+    # ── SOFT FILTER LOGIC ──────────────────────────────────────────
+    # M1 and M15 must agree on the immediate direction.
+    # H1 is now a 'Soft Filter': it only blocks if it's strongly opposed.
+    m1_m15_agree = (prediction > 0 and mid_prediction > 0) or (prediction < 0 and mid_prediction < 0)
+    
+    # Calculate opposition threshold (50% of current volatility)
+    vol_h1 = calculate_volatility(SYMBOL, LONG_TIMEFRAME, 1, ML_FEATURE_WINDOW)
+    h1_opposed = (prediction > 0 and long_prediction < -vol_h1 * 0.5) or \
+                 (prediction < 0 and long_prediction > vol_h1 * 0.5)
+
+    same_direction = m1_m15_agree and not h1_opposed
     confirmed_prediction = prediction if same_direction else 0.0
     predicted_price = tick.bid + prediction
 
     if show_analysis:
+        status_h1 = "OPPOSED (BLOCKED)" if h1_opposed else "OK"
         print(
-            f"ML Short: {prediction:+.5f} | Long: {long_prediction:+.5f} | "
+            f"ML Short: {prediction:+.5f} | Mid: {mid_prediction:+.5f} | Long: {long_prediction:+.5f} ({status_h1}) | "
             f"Confirmed: {confirmed_prediction:+.5f} | Target: {predicted_price:.5f}"
         )
         on_tick._last_analysis_ts = now_ts
@@ -407,6 +431,11 @@ def on_tick() -> None:
                     )
 
     # 7. Trail SL/TP every tick
+    positions = mt5.positions_get(symbol=SYMBOL)
+    pos_count = len(positions) if positions else 0
+    if pos_count > 0 and show_analysis:
+        print(f"🔄 Trailing {pos_count} position(s) on {SYMBOL}...")
+
     trail_sltp(
         SYMBOL,
         TIMEFRAME,
@@ -433,10 +462,10 @@ def main() -> None:
     req_bars = (
         ML_TRAINING_BARS + ML_PREDICTION_HORIZON + ML_FEATURE_WINDOW + RSI_PERIOD + 10
     )
-    available = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, req_bars)
+    available = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, req_bars)
     if available is not None and len(available) >= req_bars:
         model.train(
-            symbol,
+            SYMBOL,
             TIMEFRAME,
             ML_TRAINING_BARS,
             ML_PREDICTION_HORIZON,
@@ -445,11 +474,31 @@ def main() -> None:
         )
     else:
         print(
-            f"⚠️  Not enough bars for initial training (need {req_bars}). "
-            "Model will train after enough bars accumulate."
+            f"⚠️  Not enough M1 bars for initial training (need {req_bars}). "
+            "Short model will train after enough bars accumulate."
         )
 
-    print(f"\n🚀 Gold Scalper v3 running on {symbol} {TIMEFRAME} (Ctrl+C to stop)\n")
+    # Initial medium-term training
+    req_mid_bars = (
+        MID_TRAINING_BARS + ML_PREDICTION_HORIZON + ML_FEATURE_WINDOW + RSI_PERIOD + 10
+    )
+    available_mid = mt5.copy_rates_from_pos(SYMBOL, MID_TIMEFRAME, 0, req_mid_bars)
+    if available_mid is not None and len(available_mid) >= req_mid_bars:
+        mid_model.train(
+            SYMBOL,
+            MID_TIMEFRAME,
+            MID_TRAINING_BARS,
+            ML_PREDICTION_HORIZON,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+        )
+    else:
+        print(
+            f"⚠️  Not enough M5 bars for initial training (need {req_mid_bars}). "
+            "Mid model will train after enough bars accumulate."
+        )
+
+    print(f"\n🚀 Gold Scalper v3 running on {SYMBOL} {TIMEFRAME} (Ctrl+C to stop)\n")
 
     try:
         while True:

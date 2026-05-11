@@ -99,19 +99,42 @@ def get_ml_entry_levels(
     highs = rates["high"]
     lows = rates["low"]
 
-    if trend == 1 and prediction > 0:
-        buy_level = float(lows.min())
-        if verbose:
-            print(
-                f"📈 TREND BUY  | Low[{trend_bars}]={buy_level:.5f}  pred={prediction:.5f}"
-            )
+    # ── VOLATILITY FILTER ──────────────────────────────────────────
+    from indicators.volatility import calculate_volatility
+    current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
+    min_strength = current_vol * 0.4 # Need prediction > 40% of avg range
+    
+    # ── FIBONACCI PULLBACK FILTER ──────────────────────────────────
+    swing_high = float(highs.max())
+    swing_low = float(lows.min())
+    swing_range = swing_high - swing_low
+    
+    # Buy pullback target: price should be in the lower half of the swing (below 50%)
+    fib_50 = swing_low + swing_range * 0.50
+    fib_61 = swing_low + swing_range * 0.382 # 61.8% retracement from high
+    
+    # Current price
+    tick = mt5.symbol_info_tick(symbol)
+    curr_price = tick.bid if trend == 1 else tick.ask
 
-    elif trend == -1 and prediction < 0:
-        sell_level = float(highs.max())
-        if verbose:
-            print(
-                f"📉 TREND SELL | High[{trend_bars}]={sell_level:.5f}  pred={prediction:.5f}"
-            )
+    if trend == 1 and prediction > min_strength:
+        # Only buy if price is at or below 50% retracement (Pullback)
+        if curr_price <= fib_50:
+            buy_level = swing_low # Enter at recent low
+            if verbose:
+                print(f"📈 TREND BUY  | Fib Pullback OK (Price {curr_price:.5f} <= 50% Fib {fib_50:.5f})")
+        else:
+            if verbose: print(f"⏳ BUY Skipped | Price {curr_price:.5f} too high (above 50% Fib {fib_50:.5f})")
+
+    elif trend == -1 and prediction < -min_strength:
+        # Only sell if price is at or above 50% retracement
+        fib_50_sell = swing_high - swing_range * 0.50
+        if curr_price >= fib_50_sell:
+            sell_level = swing_high
+            if verbose:
+                print(f"📉 TREND SELL | Fib Pullback OK (Price {curr_price:.5f} >= 50% Fib {fib_50_sell:.5f})")
+        else:
+            if verbose: print(f"⏳ SELL Skipped | Price {curr_price:.5f} too low (below 50% Fib {fib_50_sell:.5f})")
 
     return buy_level, sell_level
 
@@ -141,13 +164,22 @@ def get_ml_sltp(
 
     MQL5 equivalent: GetMLSLTP()
     """
+    # ── BROKER LIMITS ──────────────────────────────────────────────
     sym = mt5.symbol_info(symbol)
+    if sym is None:
+        # Fallback if symbol info is unavailable
+        return sl_points_default * 0.0001, sl_points_default * 3 * 0.0001
+        
     point = sym.point
+    stops_level = int(sym.trade_stops_level)
+    freeze_level = int(sym.trade_freeze_level)
+    min_dist_pts = max(stops_level, freeze_level) + 20 
+    digits = sym.digits
 
     if not model.is_trained:
-        sl = sl_points_default * point
-        tp = sl_points_default * 3 * point
-        return sl, tp
+        sl = max(min_dist_pts, sl_points_default) * point
+        tp = max(min_dist_pts, sl_points_default * 3) * point
+        return round(sl, digits), round(tp, digits)
 
     current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
     prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
@@ -155,26 +187,21 @@ def get_ml_sltp(
 
     # SL based on volatility (in points)
     ml_sl_points = current_vol * 1.3
-    min_sl = sl_points_default * 0.5
+    # Don't go below broker minimum
+    min_sl = max(min_dist_pts, sl_points_default * 0.5)
     max_sl = sl_points_default * 1.8
     ml_sl_points = max(min_sl, min(max_sl, ml_sl_points))
 
     # TP multiplier
-    if pred_points > ml_sl_points * 2.5:
-        tp_mult = 3.0
-    elif pred_points < ml_sl_points * 0.8:
-        tp_mult = 2.0
-    else:
-        tp_mult = 2.5
+    tp_mult = 3.0 if pred_points > ml_sl_points * 2.5 else 2.0 if pred_points < ml_sl_points * 0.8 else 2.5
+    ml_tp_points = max(min_dist_pts, ml_sl_points * tp_mult)
 
-    ml_tp_points = ml_sl_points * tp_mult
-
-    sl_distance = ml_sl_points * point
-    tp_distance = ml_tp_points * point
+    sl_distance = round(ml_sl_points * point, digits)
+    tp_distance = round(ml_tp_points * point, digits)
 
     print(
         f"📊 ML SL/TP | vol={current_vol:.1f}  pred={pred_points:.1f}pt  "
-        f"SL={ml_sl_points:.1f}pt  TP={ml_tp_points:.1f}pt  RR=1:{tp_mult:.1f}"
+        f"SL={ml_sl_points:.1f}pt  TP={ml_tp_points:.1f}pt  RR=1:{ml_tp_points/ml_sl_points:.1f}"
     )
     return sl_distance, tp_distance
 
@@ -220,15 +247,7 @@ def trail_sltp(
 ) -> None:
     """
     Move SL (and TP) forward as the position gains profit.
-    Step size is dynamic: proportional to current volatility but always at
-    least `trailing_step_points`.
-
-    Safely handles all positions including manual trades by iterating
-    through positions directly instead of using indices.
-
-    MQL5 equivalent: TrailSLTP()
     """
-    # Get all positions for this symbol (includes manual trades)
     positions = get_symbol_positions(symbol)
     if not positions:
         return
@@ -239,20 +258,21 @@ def trail_sltp(
 
     point = sym.point
     digits = sym.digits
-
-    # Dynamic trailing distances using ML model
-    sl_dist, tp_dist = get_ml_sltp(
-        symbol, timeframe, sl_points, feature_window, rsi_period, model
-    )
-    # Ensure trail_dist is at least based on volatility
-    current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
-    sl_dist = max(sl_dist, current_vol * 2.5 * point)
     
-    stops_level = int(sym.trade_stops_level)
-    safety_buf = 30 * point  # Slightly larger safety buffer
-    min_dist = stops_level * point + safety_buf
+    # ── VOLATILITY & ML CONTEXT ────────────────────────────────────
+    current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
+    vol_dist = current_vol * point # 1.0 ATR in price units
+    
+    # Get current prediction to adjust TP
+    prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
+    pred_mag = abs(prediction)
 
-    # Iterate through actual positions instead of using indices
+    # ── MIN DISTANCE (Broker's Limit) ──────────────────────────────
+    stops_level = int(sym.trade_stops_level)
+    freeze_level = int(sym.trade_freeze_level)
+    min_dist = (max(stops_level, freeze_level) + 20) * point 
+
+    # Iterate through actual positions
     for pos in positions:
         if pos is None or pos.symbol != symbol:
             continue
@@ -265,68 +285,107 @@ def trail_sltp(
         if tick is None:
             continue
 
-        bid = tick.bid
-        ask = tick.ask
-
-        if pos.type == mt5.POSITION_TYPE_BUY:
-            price = bid
-            profit_points = (price - entry) / point
-        else:
-            price = ask
-            profit_points = (entry - price) / point
-
-        new_sl = sl
-        new_tp = tp
-
-        # Calculate target SL and TP based on current price and ML-driven distances
-        if pos.type == mt5.POSITION_TYPE_BUY:
-            target_sl = round(price - sl_dist, digits)
-            target_tp = round(price + tp_dist, digits)
-        else:
-            target_sl = round(price + sl_dist, digits)
-            target_tp = round(price - tp_dist, digits)
-
-        new_sl = sl
-        new_tp = tp
-
-        # Move SL if price is in profit and target SL is an improvement
-        if profit_points > 0:
-            is_better_sl = (pos.type == mt5.POSITION_TYPE_BUY and target_sl > sl) or \
-                           (pos.type == mt5.POSITION_TYPE_SELL and target_sl < sl)
-            
-            # Check improvement against trailing_step_points
-            if is_better_sl and abs(target_sl - sl) >= (trailing_step_points * point):
-                new_sl = target_sl
-                new_tp = target_tp
+        price = tick.bid if pos.type == mt5.POSITION_TYPE_BUY else tick.ask
+        profit_points = (price - entry) / point if pos.type == mt5.POSITION_TYPE_BUY else (entry - price) / point
+        
+        # ── 3-STAGE TRAILING LOGIC ──────────────────────────────────
+        # Stage thresholds based on ATR (current_vol)
+        stage = "Normal"
+        
+        if profit_points > current_vol * 3.0:
+            # Stage 3: Aggressive Harvest (Lock in 70% of profit)
+            # Use tight 0.8x ATR distance
+            effective_dist = vol_dist * 0.8
+            stage = "Stage 3 (Harvest)"
+        elif profit_points > current_vol * 1.2:
+            # Stage 2: Trend Following (Give room to breathe)
+            # Use wider 1.5x ATR distance
+            effective_dist = vol_dist * 1.5
+            stage = "Stage 2 (Trend)"
+        elif profit_points > current_vol * 0.7:
+            # Stage 1: 50% Profit Reserve (Lock in half of the gains)
+            # Instead of just breaking even, we take half the profit off the table
+            reserve_pts = profit_points * 0.5
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                target_sl = round(entry + reserve_pts * point, digits)
             else:
-                # If we don't meet the trailing step, keep existing SL/TP
-                continue
+                target_sl = round(entry - reserve_pts * point, digits)
+            
+            effective_dist = abs(price - target_sl)
+            stage = "Stage 1 (50% Reserve)"
         else:
-            # Not in profit, no trailing
-            continue
+            # Default: initial SL distance
+            effective_dist = sl_points * point
+            stage = "Initial"
 
-        if abs(new_sl - price) < min_dist or abs(new_tp - price) < min_dist:
-            continue
+        # Ensure effective_dist is valid
+        effective_dist = max(effective_dist, min_dist)
+        
+        # ── CALCULATE TARGETS ────────────────────────────────────────
+        if stage != "Stage 1 (Break-even)":
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                target_sl = round(price - effective_dist, digits)
+            else:
+                target_sl = round(price + effective_dist, digits)
 
-        request = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "position": pos.ticket,
-            "symbol": symbol,
-            "sl": new_sl,
-            "tp": new_tp,
-        }
-        t0 = time.perf_counter()
-        result = mt5.order_send(request)
-        lat_ms = int((time.perf_counter() - t0) * 1000)
-        logging.info(f"ACTION | TrailSLTP #{pos.ticket} | Latency: {lat_ms}ms")
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            err = mt5.last_error() if result is None else result.comment
-            print(
-                f"⚠️  TrailSLTP failed on #{pos.ticket}: {err} | "
-                f"Price: {price:.5f} | Proposed SL: {new_sl:.5f} TP: {new_tp:.5f}"
-            )
+        # Dynamic TP: If prediction weakens, pull TP closer to lock in profit
+        # If prediction mag is < 50% of the average range, use a tighter TP
+        tp_mult = 3.0 if pred_mag > current_vol * 0.5 else 1.5
+        tp_dist = effective_dist * tp_mult
+
+        if pos.type == mt5.POSITION_TYPE_BUY:
+            target_tp = round(price + tp_dist, digits)
+            # Ensure TP only moves forward or stays
+            if tp > 0 and target_tp < tp: target_tp = tp 
+            is_better_sl = (target_sl > sl) or (sl == 0)
         else:
-            print(f"✅ SL/TP Updated for #{pos.ticket} | SL: {new_sl:.5f} | TP: {new_tp:.5f}")
+            target_tp = round(price - tp_dist, digits)
+            if tp > 0 and target_tp > tp: target_tp = tp
+            is_better_sl = (target_sl < sl) or (sl == 0)
+
+        # ── SAFETY: BROKER LIMITS ───────────────────────────────────
+        if pos.type == mt5.POSITION_TYPE_BUY:
+            if target_sl > price - min_dist: target_sl = round(price - min_dist, digits)
+            if target_tp < price + min_dist: target_tp = round(price + min_dist, digits)
+        else:
+            if target_sl < price + min_dist: target_sl = round(price + min_dist, digits)
+            if target_tp > price - min_dist: target_tp = round(price - min_dist, digits)
+
+        # DEBUG: Throttled feedback
+        if not hasattr(trail_sltp, "_debug_cnt"): trail_sltp._debug_cnt = {}
+        cnt = trail_sltp._debug_cnt.get(pos.ticket, 0)
+        if profit_points > 10 and cnt % 100 == 0:
+            print(f"🔄 {stage} #{pos.ticket} | Prof: {profit_points:.1f}pt | "
+                  f"SL: {sl:.5f}->{target_sl:.5f} | Better: {is_better_sl}")
+        trail_sltp._debug_cnt[pos.ticket] = cnt + 1
+
+        # ── EXECUTE ─────────────────────────────────────────────────
+        if profit_points > 0 and is_better_sl:
+            step_pts = abs(target_sl - sl) / point if sl > 0 else 9999
+            
+            if step_pts >= trailing_step_points:
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "symbol": symbol,
+                    "sl": target_sl,
+                    "tp": target_tp,
+                }
+                
+                result = mt5.order_send(request)
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logging.info(f"ACTION | TrailSLTP {stage} #{pos.ticket} | SL: {target_sl:.5f}")
+                    print(f"✅ {stage} Updated #{pos.ticket} | SL: {target_sl:.5f}")
+                else:
+                    err = mt5.last_error() if result is None else result.comment
+                    if not hasattr(trail_sltp, "_last_err") or trail_sltp._last_err != err:
+                        logging.error(f"FAIL | TrailSLTP #{pos.ticket} | Error: {err}")
+                        print(f"❌ TrailSLTP Fail: {err}")
+                        trail_sltp._last_err = err
+
+
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1111,10 +1170,16 @@ def manage_scale_in(
 
     # Dynamic cap from risk budget
     max_positions = max(1, int(max_total_risk_percent / risk_percent))
-    print(
-        f"\u2696\ufe0f  Scale-In | cap={max_positions} "
-        f"({max_total_risk_percent:.0f}% / {risk_percent:.1f}% per trade)"
-    )
+    
+    # Throttle Scale-In status log to 30 seconds
+    now = _time.time()
+    if not hasattr(manage_scale_in, "_last_status_log"): manage_scale_in._last_status_log = 0
+    if now - manage_scale_in._last_status_log > 30:
+        print(
+            f"⚖️  Scale-In | cap={max_positions} "
+            f"({max_total_risk_percent:.0f}% / {risk_percent:.1f}% per trade)"
+        )
+        manage_scale_in._last_status_log = now
 
     # Dynamic loss threshold from current volatility
     current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
@@ -1126,69 +1191,45 @@ def manage_scale_in(
     if buy_positions and len(buy_positions) < max_positions and prediction > 0:
         for pos in buy_positions:
             profit_points = (tick.bid - pos.price_open) / point
+            
+            # Case A: Averaging Down (Scale-In)
             if profit_points < -loss_threshold_pts:
-                print(
-                    f"\U0001f4c9 Scale-In BUY #{pos.ticket} "
-                    f"losing {-profit_points:.1f} pts — trend still UP"
-                )
-                # Widen SL of existing position
+                print(f"📉 Scale-In BUY #{pos.ticket} losing {-profit_points:.1f} pts — trend still UP")
                 new_sl = round(tick.bid - sl_points_default * point * 1.5, sym.digits)
                 if pos.sl == 0 or new_sl < pos.sl:
-                    mt5.order_send(
-                        {
-                            "action": mt5.TRADE_ACTION_SLTP,
-                            "position": pos.ticket,
-                            "symbol": symbol,
-                            "sl": new_sl,
-                            "tp": pos.tp,
-                        }
-                    )
-                    print(f"   Moved SL of #{pos.ticket} -> {new_sl:.5f}")
-                # Open new buy at current better price
-                execute_buy_market(
-                    symbol,
-                    timeframe,
-                    sl_points_default,
-                    feature_window,
-                    rsi_period,
-                    risk_percent,
-                    model,
-                    allow_multiple=True,
-                )
+                    mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": pos.ticket, "symbol": symbol, "sl": new_sl, "tp": pos.tp})
+                
+                execute_buy_market(symbol, timeframe, sl_points_default, feature_window, rsi_period, risk_percent, model, allow_multiple=True)
                 _scale_in_last_time[symbol] = _time.time()
-                break  # one scale-in per cooldown cycle
+                break
+
+            # Case B: Pyramiding (Scaling Up) - Adding when in profit if "even more sure"
+            elif profit_points > current_vol * 1.5 and prediction > current_vol * 0.8:
+                print(f"🚀 Pyramiding BUY #{pos.ticket} profiting {profit_points:.1f} pts — trend is STRONG")
+                execute_buy_market(symbol, timeframe, sl_points_default, feature_window, rsi_period, risk_percent, model, allow_multiple=True)
+                _scale_in_last_time[symbol] = _time.time()
+                break
 
     # ── SELL positions ────────────────────────────────────────────────
     if sell_positions and len(sell_positions) < max_positions and prediction < 0:
         for pos in sell_positions:
             profit_points = (pos.price_open - tick.ask) / point
+            
+            # Case A: Averaging Down (Scale-In)
             if profit_points < -loss_threshold_pts:
-                print(
-                    f"\U0001f4c8 Scale-In SELL #{pos.ticket} "
-                    f"losing {-profit_points:.1f} pts — trend still DOWN"
-                )
+                print(f"📈 Scale-In SELL #{pos.ticket} losing {-profit_points:.1f} pts — trend still DOWN")
                 new_sl = round(tick.ask + sl_points_default * point * 1.5, sym.digits)
                 if pos.sl == 0 or new_sl > pos.sl:
-                    mt5.order_send(
-                        {
-                            "action": mt5.TRADE_ACTION_SLTP,
-                            "position": pos.ticket,
-                            "symbol": symbol,
-                            "sl": new_sl,
-                            "tp": pos.tp,
-                        }
-                    )
-                    print(f"   Moved SL of #{pos.ticket} -> {new_sl:.5f}")
-                execute_sell_market(
-                    symbol,
-                    timeframe,
-                    sl_points_default,
-                    feature_window,
-                    rsi_period,
-                    risk_percent,
-                    model,
-                    allow_multiple=True,
-                )
+                    mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": pos.ticket, "symbol": symbol, "sl": new_sl, "tp": pos.tp})
+                
+                execute_sell_market(symbol, timeframe, sl_points_default, feature_window, rsi_period, risk_percent, model, allow_multiple=True)
+                _scale_in_last_time[symbol] = _time.time()
+                break
+            
+            # Case B: Pyramiding (Scaling Up)
+            elif profit_points > current_vol * 1.5 and abs(prediction) > current_vol * 0.8:
+                print(f"🚀 Pyramiding SELL #{pos.ticket} profiting {profit_points:.1f} pts — trend is STRONG")
+                execute_sell_market(symbol, timeframe, sl_points_default, feature_window, rsi_period, risk_percent, model, allow_multiple=True)
                 _scale_in_last_time[symbol] = _time.time()
                 break
 

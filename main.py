@@ -168,6 +168,10 @@ def _record_trade_outcome(direction: str, profit: float) -> None:
             _consecutive_buy_losses = 0
 
 
+# Initialize trade logger with callback
+_trade_logger = TradeLogger(on_close=_record_trade_outcome)
+
+
 def _is_strong_trend_against(direction: str, symbol: str, timeframe: int, n_bars: int = 5) -> bool:
     """
     Return True if the last `n_bars` M1 candles show a strong directional move

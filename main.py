@@ -10,7 +10,7 @@ Run:
 import time
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import MetaTrader5 as mt5
@@ -499,7 +499,7 @@ def on_tick() -> None:
         trend=float(long_prediction),
         rsi=50.0,
         consecutive_losses=max(_consecutive_sell_losses, _consecutive_buy_losses),
-        open_time=datetime.utcnow(),
+        open_time=datetime.now(timezone.utc),
         recent_pnl=float(np.mean(list(rl_agent._recent_pnl))) if rl_agent._recent_pnl else 0.0,
         shap_top_norm=shap_top_norm,
         shap_conflict=shap_conflict_val,

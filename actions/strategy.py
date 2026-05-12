@@ -742,6 +742,18 @@ def execute_buy_market(
     if not allow_multiple and has_open_position(symbol, mt5.POSITION_TYPE_BUY):
         return
 
+    # Anti-hedge guard: never open a BUY while a SELL is still open
+    if has_open_position(symbol, mt5.POSITION_TYPE_SELL):
+        print(f"🚫 Anti-hedge: BUY blocked — SELL position already open on {symbol}")
+        return
+
+    # Portfolio-level guard
+    from position_manager import get_position_manager
+    ok, reason = get_position_manager().can_open_position(symbol)
+    if not ok:
+        print(f"🚫 PositionManager: BUY blocked — {reason}")
+        return
+
     ask = mt5.symbol_info_tick(symbol).ask
     entry = ask
 
@@ -799,6 +811,18 @@ def execute_sell_market(
     digits = sym.digits
 
     if not allow_multiple and has_open_position(symbol, mt5.POSITION_TYPE_SELL):
+        return
+
+    # Anti-hedge guard: never open a SELL while a BUY is still open
+    if has_open_position(symbol, mt5.POSITION_TYPE_BUY):
+        print(f"🚫 Anti-hedge: SELL blocked — BUY position already open on {symbol}")
+        return
+
+    # Portfolio-level guard
+    from position_manager import get_position_manager
+    ok, reason = get_position_manager().can_open_position(symbol)
+    if not ok:
+        print(f"🚫 PositionManager: SELL blocked — {reason}")
         return
 
     bid = mt5.symbol_info_tick(symbol).bid

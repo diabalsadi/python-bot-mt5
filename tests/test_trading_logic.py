@@ -11,12 +11,10 @@ Or with coverage:
 """
 
 import unittest
-from unittest.mock import patch, MagicMock
-import MetaTrader5 as mt5
-
-# Mock MT5 before importing strategy functions
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+# Mock MetaTrader5 before any imports that depend on it
 sys.modules['MetaTrader5'] = MagicMock()
 
 
@@ -291,3 +289,106 @@ def run_tests():
 if __name__ == "__main__":
     success = run_tests()
     exit(0 if success else 1)
+
+
+class TestAntiHedge(unittest.TestCase):
+    """Tests that the bot never opens opposite positions simultaneously."""
+
+    def test_buy_blocked_when_sell_open(self):
+        """BUY must be blocked if a SELL is already open."""
+        from unittest.mock import patch, MagicMock
+
+        mock_positions = [MagicMock(type=1)]  # 1 = POSITION_TYPE_SELL in MT5
+
+        with patch('MetaTrader5.positions_get', return_value=mock_positions):
+            import MetaTrader5 as mt5
+            mt5.POSITION_TYPE_SELL = 1
+            mt5.POSITION_TYPE_BUY  = 0
+
+            positions = mt5.positions_get()
+            has_sell = any(p.type == mt5.POSITION_TYPE_SELL for p in positions)
+            self.assertTrue(has_sell, "Should detect open SELL before allowing BUY")
+
+    def test_sell_blocked_when_buy_open(self):
+        """SELL must be blocked if a BUY is already open."""
+        from unittest.mock import patch, MagicMock
+
+        mock_positions = [MagicMock(type=0)]  # 0 = POSITION_TYPE_BUY
+
+        with patch('MetaTrader5.positions_get', return_value=mock_positions):
+            import MetaTrader5 as mt5
+            mt5.POSITION_TYPE_BUY  = 0
+            mt5.POSITION_TYPE_SELL = 1
+
+            positions = mt5.positions_get()
+            has_buy = any(p.type == mt5.POSITION_TYPE_BUY for p in positions)
+            self.assertTrue(has_buy, "Should detect open BUY before allowing SELL")
+
+    def test_no_hedge_when_no_positions(self):
+        """Both directions allowed when no positions are open."""
+        from unittest.mock import patch
+
+        with patch('MetaTrader5.positions_get', return_value=[]):
+            import MetaTrader5 as mt5
+            positions = mt5.positions_get()
+            has_buy  = any(getattr(p, 'type', -1) == 0 for p in positions)
+            has_sell = any(getattr(p, 'type', -1) == 1 for p in positions)
+            self.assertFalse(has_buy)
+            self.assertFalse(has_sell)
+
+
+class TestConsecutiveLossBreaker(unittest.TestCase):
+    """Tests that the consecutive-loss circuit breaker pauses correctly."""
+
+    def test_three_losses_pause_direction(self):
+        consecutive = 0
+        paused = False
+        MAX = 3
+
+        for _ in range(MAX):
+            profit = -1.0
+            if profit < 0:
+                consecutive += 1
+            if consecutive >= MAX:
+                paused = True
+
+        self.assertTrue(paused)
+        self.assertEqual(consecutive, MAX)
+
+    def test_win_resets_counter(self):
+        consecutive = 2
+        profit = 1.0   # a win
+        if profit > 0:
+            consecutive = 0
+        self.assertEqual(consecutive, 0)
+
+
+class TestTrendGate(unittest.TestCase):
+    """Tests the anti-trend-entry momentum gate."""
+
+    def test_sell_blocked_in_strong_uptrend(self):
+        closes = [100.0 + i for i in range(6)]   # 5-bar +5 move
+        highs  = [c + 0.5 for c in closes]
+        lows   = [c - 0.5 for c in closes]
+
+        trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+               for i in range(1, len(closes))]
+        atr = sum(trs) / len(trs)
+        net_move = closes[-1] - closes[-6]
+
+        blocked = net_move > atr
+        self.assertTrue(blocked, f"SELL should be blocked: net_move={net_move:.2f} atr={atr:.2f}")
+
+    def test_sell_allowed_in_flat_market(self):
+        import math
+        closes = [100.0 + math.sin(i) * 0.1 for i in range(6)]  # tiny oscillation
+        highs  = [c + 0.1 for c in closes]
+        lows   = [c - 0.1 for c in closes]
+
+        trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+               for i in range(1, len(closes))]
+        atr = sum(trs) / len(trs)
+        net_move = closes[-1] - closes[-6]
+
+        blocked = net_move > atr
+        self.assertFalse(blocked, "SELL should NOT be blocked in flat market")

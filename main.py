@@ -542,6 +542,11 @@ def on_tick() -> None:
     # Flush any closed deals to trades.csv
     poll_trade_log()
 
+    # Periodic portfolio status (every 5 min)
+    from position_manager import get_position_manager
+    if int(time.time()) % 300 < 2:
+        get_position_manager().report_status()
+
     # 8. Poll for newly closed trades and log them to CSV
     _trade_logger.poll_closed_deals()
 
@@ -551,6 +556,11 @@ def main() -> None:
 
     initialize_connection()
     set_trade_logger_callback(_record_trade_outcome)  # wire consecutive-loss breaker
+
+    # Initialize portfolio-level position manager
+    from position_manager import get_position_manager
+    get_position_manager().initialize_session()
+
     pretty_print(mt5.account_info(), "Account Info")
 
     symbol = get_symbol(SYMBOL)

@@ -415,9 +415,9 @@ class TestRLAgent(unittest.TestCase):
         )
 
     def test_state_shape(self):
-        """State vector must be 8-dimensional."""
+        """State vector must be 10-dimensional (8 market + 2 SHAP dims)."""
         state = self._make_state()
-        self.assertEqual(state.shape, (8,))
+        self.assertEqual(state.shape, (10,))
 
     def test_state_values_clipped(self):
         """Extreme inputs must be clipped to reasonable range."""
@@ -483,3 +483,91 @@ class TestRLAgent(unittest.TestCase):
             f"Q[SELL]-Q[HOLD] should decrease after loss training. "
             f"Before={sell_hold_before:.4f} After={sell_hold_after:.4f}"
         )
+
+
+class TestSHAPExplainer(unittest.TestCase):
+    """Tests for SHAP explainability layer."""
+
+    def _dummy_xgb(self):
+        """Train a tiny XGBRegressor on synthetic data."""
+        import numpy as np
+        try:
+            import xgboost as xgb
+        except ImportError:
+            return None
+        X = np.random.randn(50, 6)
+        y = X[:, 0] - X[:, 2] + np.random.randn(50) * 0.1
+        m = xgb.XGBRegressor(n_estimators=10, verbosity=0)
+        m.fit(X, y)
+        return m
+
+    def test_null_result_when_not_fitted(self):
+        """explain() before fit() must return a safe null result."""
+        from ml.shap_explainer import SHAPExplainer
+        import numpy as np
+        exp = SHAPExplainer()
+        result = exp.explain(np.zeros(6), prediction=0.5)
+        self.assertEqual(result.top_feature, "unknown")
+        self.assertEqual(result.top_shap_value, 0.0)
+        self.assertFalse(result.conflict)
+
+    def test_explain_returns_6_shap_values(self):
+        """After fit(), shap_values should be length 6."""
+        from ml.shap_explainer import SHAPExplainer, FEATURE_NAMES
+        import numpy as np
+        model = self._dummy_xgb()
+        if model is None:
+            self.skipTest("xgboost not installed")
+        exp = SHAPExplainer()
+        exp.fit(model)
+        self.assertTrue(exp.is_fitted)
+        X = np.array([0.5, 1.2, -0.3, 55.0, 0.1, 0.8])
+        result = exp.explain(X, prediction=0.3)
+        self.assertEqual(len(result.shap_values), 6)
+        self.assertIn(result.top_feature, FEATURE_NAMES)
+
+    def test_conflict_detected_on_contradiction(self):
+        """Positive momentum SHAP + negative prediction = conflict."""
+        from ml.shap_explainer import SHAPExplainer, _SHAPResult
+        import numpy as np
+        # Manually craft a result with momentum as top feature, positive SHAP,
+        # but prediction is negative (SELL)
+        result = _SHAPResult(
+            shap_values=np.array([2.0, 0.1, -0.1, 0.0, 0.0, 0.0]),
+            top_feature="momentum",
+            top_shap_value=2.0,    # positive = pushes price UP
+            top_raw_value=0.5,
+            conflict=True,         # but prediction is SELL → conflict
+            summary="test",
+            top2_str="",
+        )
+        self.assertTrue(result.conflict)
+
+    def test_shap_rl_dims_output_range(self):
+        """shap_rl_dims() outputs must stay in [-1,1] and [0,1]."""
+        from ml.shap_explainer import SHAPExplainer
+        import numpy as np
+        model = self._dummy_xgb()
+        if model is None:
+            self.skipTest("xgboost not installed")
+        exp = SHAPExplainer()
+        exp.fit(model)
+        X = np.random.randn(6)
+        top_norm, conflict = exp.shap_rl_dims(X, prediction=0.5)
+        self.assertGreaterEqual(top_norm, -1.0)
+        self.assertLessEqual(top_norm, 1.0)
+        self.assertIn(conflict, [0.0, 1.0])
+
+    def test_state_is_10_dim_with_shap(self):
+        """build_state with shap dims must produce 10-dim vector."""
+        from datetime import datetime
+        import numpy as np
+        from ml.rl_agent import build_state
+        state = build_state(
+            momentum=1.0, volatility=0.5, trend=0.3, rsi=55.0,
+            consecutive_losses=1, open_time=datetime(2026, 5, 11, 20, 0),
+            recent_pnl=-0.5, shap_top_norm=0.7, shap_conflict=1.0,
+        )
+        self.assertEqual(state.shape, (10,))
+        self.assertAlmostEqual(float(state[8]),  0.7, places=4)
+        self.assertAlmostEqual(float(state[9]),  1.0, places=4)

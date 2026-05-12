@@ -33,6 +33,7 @@ _HEADERS = [
     "entry_price", "exit_price",
     "lot", "sl", "tp",
     "profit_usd", "profit_pips", "duration_mins",
+    "shap_top_feature", "shap_top_value", "shap_conflict", "shap_top2",
     "comment",
 ]
 
@@ -71,14 +72,18 @@ class TradeLogger:
 
     def log_open(
         self,
-        result,           # mt5.OrderSendResult
+        result,
         symbol: str,
-        direction: str,   # "BUY" or "SELL"
+        direction: str,
         entry: float,
         sl: float,
         tp: float,
         lot: float,
         comment: str = "",
+        shap_top_feature: str = "",
+        shap_top_value: float = 0.0,
+        shap_conflict: bool = False,
+        shap_top2: str = "",
     ) -> None:
         """Call immediately after a successful order_send for a new position."""
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
@@ -86,17 +91,25 @@ class TradeLogger:
 
         ticket = result.order
         self._open_trades[ticket] = {
-            "ticket": ticket,
-            "symbol": symbol,
-            "direction": direction,
-            "open_time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "entry_price": entry,
-            "sl": sl,
-            "tp": tp,
-            "lot": lot,
-            "comment": comment,
+            "ticket":           ticket,
+            "symbol":           symbol,
+            "direction":        direction,
+            "open_time":        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "entry_price":      entry,
+            "sl":               sl,
+            "tp":               tp,
+            "lot":              lot,
+            "comment":          comment,
+            "shap_top_feature": shap_top_feature,
+            "shap_top_value":   round(shap_top_value, 5),
+            "shap_conflict":    int(shap_conflict),
+            "shap_top2":        shap_top2,
         }
-        print(f"📋 Trade logged open  #{ticket} | {direction} {symbol} @ {entry:.5f}")
+        conflict_flag = " ⚠️ CONFLICT" if shap_conflict else ""
+        print(
+            f"📋 Trade logged open  #{ticket} | {direction} {symbol} @ {entry:.5f}"
+            f" | SHAP: {shap_top_feature}={shap_top_value:+.4f}{conflict_flag}"
+        )
 
     def poll_closed_deals(self) -> None:
         """
@@ -154,20 +167,24 @@ class TradeLogger:
         direction = open_rec["direction"] if open_rec else ("BUY" if deal.type == mt5.DEAL_TYPE_BUY else "SELL")
 
         row = {
-            "ticket":        ticket,
-            "symbol":        deal.symbol,
-            "direction":     direction,
-            "open_time":     open_dt_str,
-            "close_time":    close_dt_str,
-            "entry_price":   entry_price,
-            "exit_price":    round(deal.price, 5),
-            "lot":           deal.volume,
-            "sl":            open_rec["sl"] if open_rec else 0.0,
-            "tp":            open_rec["tp"] if open_rec else 0.0,
-            "profit_usd":    round(deal.profit, 2),
-            "profit_pips":   profit_pips,
-            "duration_mins": duration_mins,
-            "comment":       open_rec["comment"] if open_rec else deal.comment,
+            "ticket":            ticket,
+            "symbol":            deal.symbol,
+            "direction":         direction,
+            "open_time":         open_dt_str,
+            "close_time":        close_dt_str,
+            "entry_price":       entry_price,
+            "exit_price":        round(deal.price, 5),
+            "lot":               deal.volume,
+            "sl":                open_rec["sl"]   if open_rec else 0.0,
+            "tp":                open_rec["tp"]   if open_rec else 0.0,
+            "profit_usd":        round(deal.profit, 2),
+            "profit_pips":       profit_pips,
+            "duration_mins":     duration_mins,
+            "shap_top_feature":  open_rec.get("shap_top_feature", "") if open_rec else "",
+            "shap_top_value":    open_rec.get("shap_top_value",   0.0) if open_rec else 0.0,
+            "shap_conflict":     open_rec.get("shap_conflict",    0)   if open_rec else 0,
+            "shap_top2":         open_rec.get("shap_top2",        "")  if open_rec else "",
+            "comment":           open_rec["comment"] if open_rec else deal.comment,
         }
 
         self._append_row(row)

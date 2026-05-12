@@ -3,3 +3,4 @@ MetaTrader5
 numpy
 xgboost
 scikit-learn
+shap

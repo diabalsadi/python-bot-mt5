@@ -26,6 +26,7 @@ import logging
 from datetime import datetime
 
 import MetaTrader5 as mt5
+import numpy as np
 
 from indicators.volatility import calculate_volatility
 from indicators.trend import get_technical_trend
@@ -790,7 +791,21 @@ def execute_buy_market(
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Buy Market failed: {err}")
     else:
-        _trade_logger.log_open(result, symbol, "BUY", entry, sl, tp, lot, "ML buy market")
+        shap_res = model.shap.explain(
+            np.array(get_features(symbol, timeframe, 0, feature_window, rsi_period)),
+            prediction=model.predict(symbol, timeframe, feature_window, rsi_period),
+        ) if model.shap.is_fitted else None
+
+        _trade_logger.log_open(
+            result, symbol, "BUY", entry, sl, tp, lot,
+            comment="ML buy market",
+            shap_top_feature=shap_res.top_feature    if shap_res else "",
+            shap_top_value=shap_res.top_shap_value   if shap_res else 0.0,
+            shap_conflict=shap_res.conflict          if shap_res else False,
+            shap_top2=shap_res.top2_str              if shap_res else "",
+        )
+        if shap_res:
+            print(f"  {shap_res.summary}")
 
 
 def execute_sell_market(
@@ -863,7 +878,21 @@ def execute_sell_market(
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Sell Market failed: {err}")
     else:
-        _trade_logger.log_open(result, symbol, "SELL", entry, sl, tp, lot, "ML sell market")
+        shap_res = model.shap.explain(
+            np.array(get_features(symbol, timeframe, 0, feature_window, rsi_period)),
+            prediction=model.predict(symbol, timeframe, feature_window, rsi_period),
+        ) if model.shap.is_fitted else None
+
+        _trade_logger.log_open(
+            result, symbol, "SELL", entry, sl, tp, lot,
+            comment="ML sell market",
+            shap_top_feature=shap_res.top_feature    if shap_res else "",
+            shap_top_value=shap_res.top_shap_value   if shap_res else 0.0,
+            shap_conflict=shap_res.conflict          if shap_res else False,
+            shap_top2=shap_res.top2_str              if shap_res else "",
+        )
+        if shap_res:
+            print(f"  {shap_res.summary}")
 
 
 # ══════════════════════════════════════════════════════════════════════

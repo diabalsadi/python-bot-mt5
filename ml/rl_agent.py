@@ -51,7 +51,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 # ── Constants ────────────────────────────────────────────────────────────────
-STATE_DIM    = 8
+STATE_DIM    = 10   # 8 market/context features + 2 SHAP-derived features
 ACTION_DIM   = 3          # HOLD=0, BUY=1, SELL=2
 HIDDEN1      = 64
 HIDDEN2      = 32
@@ -193,9 +193,11 @@ def build_state(
     consecutive_losses:  int,
     open_time:           datetime,
     recent_pnl:          float,
+    shap_top_norm:       float = 0.0,
+    shap_conflict:       float = 0.0,
 ) -> np.ndarray:
     """
-    Build the 8-dim normalised state vector.
+    Build the 10-dim normalised state vector.
 
     Args:
         momentum:           (price_now - price_N_ago) / price_N_ago * 1000
@@ -205,20 +207,24 @@ def build_state(
         consecutive_losses: count of same-direction losses in a row
         open_time:          datetime of the bar
         recent_pnl:         mean P&L of last 5 closed trades
+        shap_top_norm:      top SHAP value normalised to [-1, 1] (0.0 if unavailable)
+        shap_conflict:      1.0 if top SHAP feature contradicts prediction, else 0.0
     """
-    tod  = (open_time.hour * 60 + open_time.minute) / 1440.0
+    tod     = (open_time.hour * 60 + open_time.minute) / 1440.0
     tod_sin = math.sin(2 * math.pi * tod)
     tod_cos = math.cos(2 * math.pi * tod)
 
     return np.array([
-        np.clip(momentum / 5.0,   -3, 3),          # normalise ~[-3,3]
-        np.clip(volatility / 2.0, 0, 5),            # normalise
+        np.clip(momentum / 5.0,   -3, 3),
+        np.clip(volatility / 2.0,  0, 5),
         np.clip(trend / 5.0,      -3, 3),
-        (rsi - 50.0) / 50.0,                        # [-1, 1]
-        min(consecutive_losses / 5.0, 2.0),         # cap at 2
+        (rsi - 50.0) / 50.0,
+        min(consecutive_losses / 5.0, 2.0),
         tod_sin,
         tod_cos,
-        np.clip(recent_pnl / 5.0, -3, 3),           # normalise
+        np.clip(recent_pnl / 5.0, -3, 3),
+        float(np.clip(shap_top_norm, -1.0, 1.0)),   # dim 9: SHAP magnitude
+        float(np.clip(shap_conflict,  0.0, 1.0)),   # dim 10: conflict flag
     ], dtype=np.float32)
 
 
@@ -529,6 +535,13 @@ class RLAgent:
 
     def load(self, path: str = "rl_weights.npz") -> None:
         d = np.load(path)
+        # Check W1 shape matches current STATE_DIM — if not, reinitialise
+        if d["W1"].shape[0] != STATE_DIM:
+            print(
+                f"⚠️  rl_weights.npz has W1 shape {d['W1'].shape} "
+                f"but current STATE_DIM={STATE_DIM} — reinitialising (new SHAP dims added)"
+            )
+            return
         self.q_net.set_weights({k: d[k] for k in ("W1","b1","W2","b2","W3","b3")})
         self.target_net.copy_weights_from(self.q_net)
         self.epsilon = float(d["epsilon"][0])

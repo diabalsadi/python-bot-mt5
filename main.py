@@ -48,6 +48,7 @@ from indicators.volatility import calculate_volatility
 from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
 from ml.rl_agent import RLAgent, build_state, ACTIONS
+from ml.features import get_features
 from mt5_tool.symbol import get_symbol
 from tools.print import pretty_print
 from tools.trade_logger import TradeLogger
@@ -484,14 +485,24 @@ def on_tick() -> None:
     global _last_rl_state, _last_rl_action
     now_ts_entry = time.time()
 
+    # SHAP dims from the short-term model (0.0 until first retrain completes)
+    _raw_feats = get_features(SYMBOL, TIMEFRAME, 0, ML_FEATURE_WINDOW, RSI_PERIOD) \
+        if model.is_trained else None
+    shap_top_norm, shap_conflict_val = (
+        model.shap.shap_rl_dims(np.array(_raw_feats), prediction)
+        if (model.shap.is_fitted and _raw_feats is not None) else (0.0, 0.0)
+    )
+
     _last_rl_state = build_state(
         momentum=float(prediction),
         volatility=float(calculate_volatility(SYMBOL, TIMEFRAME, 0, ML_FEATURE_WINDOW)),
         trend=float(long_prediction),
-        rsi=50.0,  # approximation — full RSI computed inside get_features
+        rsi=50.0,
         consecutive_losses=max(_consecutive_sell_losses, _consecutive_buy_losses),
         open_time=datetime.utcnow(),
         recent_pnl=float(np.mean(list(rl_agent._recent_pnl))) if rl_agent._recent_pnl else 0.0,
+        shap_top_norm=shap_top_norm,
+        shap_conflict=shap_conflict_val,
     )
 
     sell_allowed = (

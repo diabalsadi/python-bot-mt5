@@ -32,6 +32,7 @@ except ImportError:
     print("    Run: pip install xgboost scikit-learn")
 
 from ml.features import get_features
+from ml.shap_explainer import SHAPExplainer
 
 
 class LinearRegressionModel:
@@ -70,6 +71,9 @@ class LinearRegressionModel:
         self._feature_std = None
 
         self._use_xgb: bool = _XGB_AVAILABLE
+
+        # SHAP explainer — fitted after each train() call
+        self.shap = SHAPExplainer()
 
     # ── Training ──────────────────────────────────────────────────────
 
@@ -150,6 +154,9 @@ class LinearRegressionModel:
 
         self._scaler    = scaler
         self._xgb_model = model
+
+        # Fit SHAP explainer on the newly trained model
+        self.shap.fit(model)
 
         # Map feature importances to beta slots for the existing logging line
         fi = model.feature_importances_

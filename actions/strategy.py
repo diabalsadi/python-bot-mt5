@@ -31,6 +31,7 @@ import numpy as np
 from indicators.volatility import calculate_volatility
 from indicators.trend import get_technical_trend
 from ml.model import LinearRegressionModel
+from ml.features import get_features
 from tools.trade_logger import TradeLogger
 
 _trade_logger = TradeLogger()   # on_close callback set by main.py via set_trade_logger_callback()
@@ -791,10 +792,14 @@ def execute_buy_market(
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Buy Market failed: {err}")
     else:
-        shap_res = model.shap.explain(
-            np.array(get_features(symbol, timeframe, 0, feature_window, rsi_period)),
-            prediction=model.predict(symbol, timeframe, feature_window, rsi_period),
-        ) if model.shap.is_fitted else None
+        try:
+            shap_res = model.shap.explain(
+                np.array(get_features(symbol, timeframe, 0, feature_window, rsi_period)),
+                prediction=model.predict(symbol, timeframe, feature_window, rsi_period),
+            ) if model.shap.is_fitted else None
+        except Exception as e:
+            print(f"⚠️  SHAP explain error (non-fatal): {e}")
+            shap_res = None
 
         _trade_logger.log_open(
             result, symbol, "BUY", entry, sl, tp, lot,
@@ -878,10 +883,14 @@ def execute_sell_market(
         err = mt5.last_error() if result is None else result.comment
         print(f"❌ Sell Market failed: {err}")
     else:
-        shap_res = model.shap.explain(
-            np.array(get_features(symbol, timeframe, 0, feature_window, rsi_period)),
-            prediction=model.predict(symbol, timeframe, feature_window, rsi_period),
-        ) if model.shap.is_fitted else None
+        try:
+            shap_res = model.shap.explain(
+                np.array(get_features(symbol, timeframe, 0, feature_window, rsi_period)),
+                prediction=model.predict(symbol, timeframe, feature_window, rsi_period),
+            ) if model.shap.is_fitted else None
+        except Exception as e:
+            print(f"⚠️  SHAP explain error (non-fatal): {e}")
+            shap_res = None
 
         _trade_logger.log_open(
             result, symbol, "SELL", entry, sl, tp, lot,

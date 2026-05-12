@@ -1,6 +1,30 @@
-python-dotenv
-MetaTrader5
-numpy
-xgboost
-scikit-learn
-shap
+# ─────────────────────────────────────────────────────────────────────
+# python-bot-mt5 — full dependency list
+# Python 3.10+ required  (tested on 3.12.3)
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# On Linux / Raspberry Pi (system-managed Python):
+#   pip install -r requirements.txt --break-system-packages
+# ─────────────────────────────────────────────────────────────────────
+
+# ── MT5 broker connection ─────────────────────────────────────────────
+MetaTrader5>=5.0.45          # Windows only; mock for dev/CI on Linux
+
+# ── Environment / config ─────────────────────────────────────────────
+python-dotenv>=1.0.0         # loads .env credentials
+
+# ── Numerical core ───────────────────────────────────────────────────
+numpy>=1.26.0                # arrays, lstsq, all maths
+
+# ── ML stack ─────────────────────────────────────────────────────────
+xgboost>=2.0.0               # gradient-boosted trees (replaces linear OLS)
+scikit-learn>=1.3.0          # StandardScaler for feature normalisation
+
+# ── Explainability ───────────────────────────────────────────────────
+shap>=0.44.0                 # SHAP values for XGBoost predictions
+                             # provides conflict-detection signal fed to RL
+
+# ── Testing ──────────────────────────────────────────────────────────
+pytest>=7.0.0                # test runner  (run: pytest tests/)

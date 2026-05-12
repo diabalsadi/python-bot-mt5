@@ -10,11 +10,12 @@ Why XGBoost over linear regression for gold scalping:
   - Built-in feature importance for transparency
   - Regularisation (L1/L2) avoids overfitting on noisy tick data
 
-Interface is identical to the old LinearRegressionModel so main.py
-and strategy.py require no changes.
+XGBoost is scale-invariant (tree splits on thresholds, not distances),
+so scikit-learn's StandardScaler is not needed.  We store mean/std
+manually for the OLS fallback path and for normalising SHAP inputs.
 
 Requires:
-    pip install xgboost scikit-learn
+    pip install xgboost
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ import MetaTrader5 as mt5
 
 try:
     import xgboost as xgb
-    from sklearn.preprocessing import StandardScaler
     _XGB_AVAILABLE = True
 except ImportError:
     _XGB_AVAILABLE = False
@@ -63,9 +63,9 @@ class LinearRegressionModel:
 
         # XGBoost internals
         self._xgb_model = None
-        self._scaler = None
+        # No scaler needed — XGBoost is scale-invariant (tree splits on thresholds)
 
-        # OLS fallback internals
+        # OLS fallback internals (also stores mean/std for SHAP normalisation)
         self._ols_betas = None
         self._feature_mean = None
         self._feature_std = None
@@ -134,9 +134,13 @@ class LinearRegressionModel:
         self.is_trained = True
 
     def _train_xgb(self, X, y, point) -> None:
-        """Fit XGBRegressor after StandardScaler normalisation."""
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
+        """Fit XGBRegressor on raw features.
+        XGBoost is scale-invariant (splits on thresholds) so StandardScaler
+        is not needed. We store mean/std for the OLS fallback and SHAP normalisation."""
+        mean = X.mean(axis=0)
+        std  = X.std(axis=0);  std[std == 0] = 1.0
+        self._feature_mean = mean
+        self._feature_std  = std
 
         model = xgb.XGBRegressor(
             n_estimators=200,
@@ -150,9 +154,8 @@ class LinearRegressionModel:
             verbosity=0,
             n_jobs=1,
         )
-        model.fit(X_scaled, y)
+        model.fit(X, y)   # raw features — no scaling needed
 
-        self._scaler    = scaler
         self._xgb_model = model
 
         # Fit SHAP explainer on the newly trained model
@@ -207,8 +210,7 @@ class LinearRegressionModel:
         X = np.array(feats, dtype=np.float64).reshape(1, -1)
 
         if self._use_xgb and self._xgb_model is not None:
-            X_scaled = self._scaler.transform(X)
-            pred_pts = float(self._xgb_model.predict(X_scaled)[0])
+            pred_pts = float(self._xgb_model.predict(X)[0])  # XGBoost: raw features, no scaling
         else:
             X_norm = (X - self._feature_mean) / self._feature_std
             X_aug  = np.column_stack([np.ones(1), X_norm])
@@ -241,8 +243,7 @@ class LinearRegressionModel:
         h_ratio = horizon / max(1, self.prediction_horizon)
 
         if self._use_xgb and self._xgb_model is not None:
-            X_scaled = self._scaler.transform(X)
-            pred_pts = float(self._xgb_model.predict(X_scaled)[0]) * h_ratio
+            pred_pts = float(self._xgb_model.predict(X)[0]) * h_ratio  # raw features
         else:
             X_norm = (X - self._feature_mean) / self._feature_std
             X_aug  = np.column_stack([np.ones(1), X_norm])

@@ -10,8 +10,11 @@ Run:
 import time
 import os
 import logging
+from datetime import datetime
+from typing import Optional
 
 import MetaTrader5 as mt5
+import numpy as np
 
 logging.basicConfig(
     filename="latency.log",
@@ -44,6 +47,7 @@ from indicators.atr import check_high_volatility
 from indicators.volatility import calculate_volatility
 from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
+from ml.rl_agent import RLAgent, build_state, ACTIONS
 from mt5_tool.symbol import get_symbol
 from tools.print import pretty_print
 from tools.trade_logger import TradeLogger
@@ -112,6 +116,11 @@ SR_LOOKBACK_BARS = 50  # Bars used to detect S/R levels
 model = LinearRegressionModel()  # short-term M1 model
 mid_model = LinearRegressionModel()  # medium-term M5 model
 long_model = LinearRegressionModel()  # long-term H1 model (3 months)
+
+# RL gating agent
+rl_agent = RLAgent(weights_path="rl_weights.npz")
+_last_rl_state: Optional[np.ndarray] = None
+_last_rl_action: int = 0
 total_bars = 0
 ml_train_counter = 0
 mid_train_counter = 0
@@ -140,10 +149,24 @@ _last_logged_direction: str = ""
 
 
 def _record_trade_outcome(direction: str, profit: float) -> None:
-    """Call after a position closes to update the loss counter."""
+    """Call after a position closes to update the loss counter and train RL."""
     global _consecutive_sell_losses, _consecutive_buy_losses
     global _sell_paused_until, _buy_paused_until
 
+    # ── RL online update ──────────────────────────────────────────────
+    if _last_rl_state is not None:
+        action = 1 if direction == "BUY" else 2
+        next_state = _last_rl_state.copy()  # best approximation available
+        rl_agent.store(_last_rl_state, action, profit, next_state, done=False)
+        loss = rl_agent.learn()
+        if loss > 0:
+            logging.info(f"RL online update | dir={direction} P&L=${profit:+.2f} loss={loss:.4f} ε={rl_agent.epsilon:.3f}")
+
+        # Persist weights periodically (every 50 online updates)
+        if rl_agent._steps > 0 and rl_agent._steps % 50 == 0:
+            rl_agent.save("rl_weights.npz")
+
+    # ── Consecutive loss circuit breaker ─────────────────────────────
     if direction == "SELL":
         if profit < 0:
             _consecutive_sell_losses += 1
@@ -457,8 +480,19 @@ def on_tick() -> None:
             SR_LOOKBACK_BARS,
         )
 
-    # 6d. Place new orders — guarded by trend gate + consecutive loss pause
+    # 6d. Build RL state and gate entry signals
+    global _last_rl_state, _last_rl_action
     now_ts_entry = time.time()
+
+    _last_rl_state = build_state(
+        momentum=float(prediction),
+        volatility=float(calculate_volatility(SYMBOL, TIMEFRAME, 0, ML_FEATURE_WINDOW)),
+        trend=float(long_prediction),
+        rsi=50.0,  # approximation — full RSI computed inside get_features
+        consecutive_losses=max(_consecutive_sell_losses, _consecutive_buy_losses),
+        open_time=datetime.utcnow(),
+        recent_pnl=float(np.mean(list(rl_agent._recent_pnl))) if rl_agent._recent_pnl else 0.0,
+    )
 
     sell_allowed = (
         now_ts_entry > _sell_paused_until
@@ -470,26 +504,20 @@ def on_tick() -> None:
     )
 
     if buy_level > 0 and buy_allowed:
-        execute_buy_market(
-            SYMBOL,
-            TIMEFRAME,
-            SL_POINTS,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
-            RISK_PERCENT,
-            model,
-        )
+        rl_action, rl_reason = rl_agent.act_verbose(_last_rl_state, ml_action=1)
+        _last_rl_action = rl_action
+        if rl_action == 1:
+            execute_buy_market(SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD, RISK_PERCENT, model)
+        else:
+            print(f"🤖 RL HOLD (blocked BUY) | {rl_reason}")
 
     if sell_level > 0 and sell_allowed:
-        execute_sell_market(
-            SYMBOL,
-            TIMEFRAME,
-            SL_POINTS,
-            ML_FEATURE_WINDOW,
-            RSI_PERIOD,
-            RISK_PERCENT,
-            model,
-        )
+        rl_action, rl_reason = rl_agent.act_verbose(_last_rl_state, ml_action=2)
+        _last_rl_action = rl_action
+        if rl_action == 2:
+            execute_sell_market(SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD, RISK_PERCENT, model)
+        else:
+            print(f"🤖 RL HOLD (blocked SELL) | {rl_reason}")
 
     # 6e. Place Fibonacci orders
     fibo_levels = get_m30_fibo_levels(SYMBOL)
@@ -546,6 +574,7 @@ def on_tick() -> None:
     from position_manager import get_position_manager
     if int(time.time()) % 300 < 2:
         get_position_manager().report_status()
+        rl_agent.report()
 
     # 8. Poll for newly closed trades and log them to CSV
     _trade_logger.poll_closed_deals()
@@ -555,7 +584,13 @@ def main() -> None:
     global model
 
     initialize_connection()
-    set_trade_logger_callback(_record_trade_outcome)  # wire consecutive-loss breaker
+    set_trade_logger_callback(_record_trade_outcome)
+
+    # RL agent: warm-start from any existing trade history
+    if os.path.exists("trades.csv"):
+        rl_agent.train_from_csv("trades.csv")
+    else:
+        print("⚠️  trades.csv not found — RL agent starting cold (will learn online)")
 
     # Initialize portfolio-level position manager
     from position_manager import get_position_manager

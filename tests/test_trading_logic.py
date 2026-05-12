@@ -392,3 +392,94 @@ class TestTrendGate(unittest.TestCase):
 
         blocked = net_move > atr
         self.assertFalse(blocked, "SELL should NOT be blocked in flat market")
+
+
+class TestRLAgent(unittest.TestCase):
+    """Tests for the DQN reinforcement learning agent."""
+
+    def _make_state(self, momentum=0.0, consec=0, recent_pnl=0.0):
+        from datetime import datetime
+        import numpy as np
+        # Import build_state without triggering MT5
+        import sys
+        sys.modules.setdefault('MetaTrader5', MagicMock())
+        from ml.rl_agent import build_state
+        return build_state(
+            momentum=momentum,
+            volatility=1.0,
+            trend=0.0,
+            rsi=50.0,
+            consecutive_losses=consec,
+            open_time=datetime(2026, 5, 11, 20, 0, 0),
+            recent_pnl=recent_pnl,
+        )
+
+    def test_state_shape(self):
+        """State vector must be 8-dimensional."""
+        state = self._make_state()
+        self.assertEqual(state.shape, (8,))
+
+    def test_state_values_clipped(self):
+        """Extreme inputs must be clipped to reasonable range."""
+        state = self._make_state(momentum=9999.0, consec=100, recent_pnl=-9999.0)
+        self.assertTrue(all(abs(v) <= 10 for v in state), f"Unclipped state: {state}")
+
+    def test_act_returns_valid_action(self):
+        """act() must return 0, 1, or 2."""
+        from ml.rl_agent import RLAgent
+        agent = RLAgent()
+        state = self._make_state()
+        action = agent.act(state)
+        self.assertIn(action, [0, 1, 2])
+
+    def test_act_respects_ml_hint(self):
+        """When ml_action given, result must be that action or HOLD (0)."""
+        from ml.rl_agent import RLAgent
+        agent = RLAgent()
+        # Force greedy (epsilon=0)
+        agent.epsilon = 0.0
+        state = self._make_state()
+        action = agent.act(state, ml_action=2)
+        self.assertIn(action, [0, 2], f"Expected HOLD or SELL, got {action}")
+
+    def test_store_and_learn(self):
+        """store() + learn() should not raise and return a float loss."""
+        from ml.rl_agent import RLAgent, BATCH_SIZE
+        agent = RLAgent()
+        state = self._make_state()
+        # Fill replay buffer above batch size
+        for _ in range(BATCH_SIZE + 5):
+            agent.store(state, 2, -1.5, state, False)
+        loss = agent.learn()
+        self.assertIsInstance(loss, float)
+        self.assertGreaterEqual(loss, 0.0)
+
+    def test_consecutive_loss_increases_hold_tendency(self):
+        """Q[SELL] should decrease relative to Q[HOLD] after repeated SELL losses."""
+        from ml.rl_agent import RLAgent, BATCH_SIZE
+        import numpy as np
+        agent = RLAgent()
+        agent.epsilon = 0.0  # pure greedy
+
+        bad_state = self._make_state(momentum=2.0, consec=5, recent_pnl=-8.0)
+
+        # Measure Q[SELL] - Q[HOLD] before training
+        x = bad_state.reshape(1, -1).astype(np.float64)
+        q_before = agent.q_net.forward(x)[0].copy()
+        sell_hold_before = q_before[2] - q_before[0]
+
+        # Fill buffer with many SELL losses and train heavily
+        for _ in range(BATCH_SIZE * 10):
+            agent.store(bad_state, 2, -2.0, bad_state, False)
+        for _ in range(50):
+            agent.learn()
+
+        q_after = agent.q_net.forward(x)[0]
+        sell_hold_after = q_after[2] - q_after[0]
+
+        # Q[SELL] should have moved DOWN relative to Q[HOLD] after loss training
+        self.assertLess(
+            sell_hold_after, sell_hold_before,
+            f"Q[SELL]-Q[HOLD] should decrease after loss training. "
+            f"Before={sell_hold_before:.4f} After={sell_hold_after:.4f}"
+        )

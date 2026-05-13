@@ -383,12 +383,22 @@ def on_tick() -> None:
         SYMBOL, LONG_TIMEFRAME, ML_FEATURE_WINDOW, RSI_PERIOD
     )
 
-    # ── SOFT FILTER LOGIC ──────────────────────────────────────────
-    # M1 and M15 must agree on the immediate direction.
-    # H1 is now a 'Soft Filter': it only blocks if it's strongly opposed.
-    m1_m15_agree = (prediction > 0 and mid_prediction > 0) or (prediction < 0 and mid_prediction < 0)
-    
-    # Calculate opposition threshold (50% of current volatility)
+    # ── CONFLUENCE FILTER ──────────────────────────────────────────────
+    # M1 and M15 must agree AND M15 must not be overwhelmingly opposed.
+    # If mid_prediction is >3× stronger than short in the opposite direction,
+    # mid wins — this prevents entering BUY when mid screams SELL.
+    mid_dominates_opposite = (
+        prediction > 0 and mid_prediction < 0 and abs(mid_prediction) > abs(prediction) * 3
+    ) or (
+        prediction < 0 and mid_prediction > 0 and abs(mid_prediction) > abs(prediction) * 3
+    )
+
+    m1_m15_agree = (
+        (prediction > 0 and mid_prediction > 0) or
+        (prediction < 0 and mid_prediction < 0)
+    ) and not mid_dominates_opposite
+
+    # H1 soft filter: only blocks if strongly opposed (>50% of H1 volatility)
     vol_h1 = calculate_volatility(SYMBOL, LONG_TIMEFRAME, 1, ML_FEATURE_WINDOW)
     h1_opposed = (prediction > 0 and long_prediction < -vol_h1 * 0.5) or \
                  (prediction < 0 and long_prediction > vol_h1 * 0.5)
@@ -404,18 +414,22 @@ def on_tick() -> None:
             f"Confirmed: {confirmed_prediction:+.5f} | Target: {predicted_price:.5f}"
         )
         _last_analysis_ts = now_ts
-    # 6b. Get ML entry levels (Synchronized with confirmed prediction)
-    buy_level, sell_level = get_ml_entry_levels(
-        SYMBOL,
-        TIMEFRAME,
-        TREND_BARS,
-        ML_FEATURE_WINDOW,
-        RSI_PERIOD,
-        EMA_PERIOD,
-        model,
-        prediction=confirmed_prediction,
-        verbose=show_analysis,
-    )
+    # 6b. Get ML entry levels — only if confluence confirmed
+    # If confirmed_prediction == 0 (models disagree), skip entirely
+    if confirmed_prediction == 0.0:
+        buy_level = sell_level = 0.0
+    else:
+        buy_level, sell_level = get_ml_entry_levels(
+            SYMBOL,
+            TIMEFRAME,
+            TREND_BARS,
+            ML_FEATURE_WINDOW,
+            RSI_PERIOD,
+            EMA_PERIOD,
+            model,
+            prediction=confirmed_prediction,
+            verbose=show_analysis,
+        )
 
     # 6b.5 Get quick-profit levels for tight TP (15m S/R based)
     buy_tight_tp, buy_extended_tp = (

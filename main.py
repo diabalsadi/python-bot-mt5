@@ -49,6 +49,7 @@ from indicators.fibonacci import get_m30_fibo_levels
 from ml.model import LinearRegressionModel
 from ml.rl_agent import RLAgent, build_state, ACTIONS
 from ml.features import get_features
+from indicators.regime import detect_regime, Regime
 from mt5_tool.symbol import get_symbol
 from tools.print import pretty_print
 from tools.trade_logger import TradeLogger
@@ -238,6 +239,43 @@ def _is_strong_trend_against(direction: str, symbol: str, timeframe: int, n_bars
 
     return False
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Session filter — block the NY open chaos window (19:00–20:30 UTC)
+# Both live sessions blew up exactly in this window
+# ──────────────────────────────────────────────────────────────────────
+
+# Configurable: (hour_utc, minute_utc) pairs for block window
+_SESSION_BLOCK_START = (19, 0)   # 19:00 UTC — London close / NY open overlap
+_SESSION_BLOCK_END   = (20, 30)  # 20:30 UTC
+
+
+def _is_session_blocked() -> bool:
+    """Return True during the NY open overlap window (19:00–20:30 UTC)."""
+    now_utc = datetime.now(timezone.utc)
+    h, m = now_utc.hour, now_utc.minute
+    cur_mins  = h * 60 + m
+    start_mins = _SESSION_BLOCK_START[0] * 60 + _SESSION_BLOCK_START[1]
+    end_mins   = _SESSION_BLOCK_END[0]   * 60 + _SESSION_BLOCK_END[1]
+    return start_mins <= cur_mins <= end_mins
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Regime cache — only re-detect every 5 minutes (expensive)
+# ──────────────────────────────────────────────────────────────────────
+
+_regime_cache: dict = {"regime": Regime.UNKNOWN, "confidence": 0.0, "ts": 0.0}
+_REGIME_CACHE_TTL = 300.0   # seconds
+
+
+def _get_regime() -> tuple[Regime, float]:
+    """Return cached regime, refreshing every 5 minutes."""
+    global _regime_cache
+    if time.time() - _regime_cache["ts"] > _REGIME_CACHE_TTL:
+        r, c = detect_regime(SYMBOL, TIMEFRAME)
+        _regime_cache = {"regime": r, "confidence": c, "ts": time.time()}
+        print(f"🔭 Regime: {r.value}  confidence={c:.2f}")
+    return _regime_cache["regime"], _regime_cache["confidence"]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -527,6 +565,36 @@ def on_tick() -> None:
         now_ts_entry > _buy_paused_until
         and not _is_strong_trend_against("BUY", SYMBOL, TIMEFRAME)
     )
+
+    # ── Session filter: block NY open chaos window ─────────────────
+    if _is_session_blocked():
+        sell_allowed = buy_allowed = False
+        if int(now_ts_entry) % 120 < 2:
+            print("⏰ Session filter: no entries 19:00–20:30 UTC (NY open window)")
+
+    # ── Regime filter ──────────────────────────────────────────────
+    regime, regime_conf = _get_regime()
+    if regime == Regime.RANGING and regime_conf > 0.5:
+        sell_allowed = buy_allowed = False
+        if int(now_ts_entry) % 120 < 2:
+            print(f"🔭 Regime RANGING ({regime_conf:.2f}) — no new entries")
+    elif regime == Regime.TRENDING_UP and regime_conf > 0.6:
+        sell_allowed = False   # don't fight a strong trend
+    elif regime == Regime.TRENDING_DOWN and regime_conf > 0.6:
+        buy_allowed = False
+
+    # ── Order-flow filters: spread and bar-range ───────────────────
+    from indicators.order_flow import calculate_spread_norm, calculate_bar_range_ratio
+    spread_norm = calculate_spread_norm(SYMBOL, TIMEFRAME)
+    bar_range   = calculate_bar_range_ratio(SYMBOL, TIMEFRAME)
+    if spread_norm > 1.0:
+        sell_allowed = buy_allowed = False
+        if int(now_ts_entry) % 60 < 2:
+            print(f"🚫 Spread too wide ({spread_norm:.2f}× ATR) — skipping entry")
+    if bar_range > 2.5:
+        sell_allowed = buy_allowed = False
+        if int(now_ts_entry) % 60 < 2:
+            print(f"🚫 Abnormal bar range ({bar_range:.2f}×) — news/spike, skipping")
 
     if buy_level > 0 and buy_allowed:
         rl_action, rl_reason = rl_agent.act_verbose(_last_rl_state, ml_action=1)

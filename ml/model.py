@@ -57,6 +57,9 @@ class LinearRegressionModel:
         self.beta4: float = 0.0
         self.beta5: float = 0.0
         self.beta6: float = 0.0
+        self.beta7: float = 0.0   # volume_delta
+        self.beta8: float = 0.0   # spread_norm
+        self.beta9: float = 0.0   # bar_range_ratio
 
         self.is_trained: bool = False
         self.prediction_horizon: int = 15
@@ -166,6 +169,9 @@ class LinearRegressionModel:
         self.beta0 = 0.0
         self.beta1, self.beta2, self.beta3 = float(fi[0]), float(fi[1]), float(fi[2])
         self.beta4, self.beta5, self.beta6 = float(fi[3]), float(fi[4]), float(fi[5])
+        self.beta7 = float(fi[6]) if len(fi) > 6 else 0.0
+        self.beta8 = float(fi[7]) if len(fi) > 7 else 0.0
+        self.beta9 = float(fi[8]) if len(fi) > 8 else 0.0
 
     def _train_ols(self, X, y) -> None:
         """Fallback: joint OLS via numpy lstsq with manual standardisation."""

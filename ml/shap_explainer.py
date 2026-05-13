@@ -43,17 +43,22 @@ FEATURE_NAMES = [
     "rsi",
     "sr_distance",
     "liquidity",
+    "volume_delta",
+    "spread_norm",
+    "bar_range_ratio",
 ]
 
-# Which features are "directional" — positive value = bullish signal
-# Used to detect conflicts between SHAP attribution and prediction sign
+# Which features are directional (positive = bullish signal)
 _BULLISH_POSITIVE = {
-    "momentum":    True,   # positive momentum → bullish
-    "volatility":  False,  # volatility is non-directional
-    "trend_slope": True,   # positive slope → bullish
-    "rsi":         True,   # high RSI → overbought (bearish), but raw value is 0–100
-    "sr_distance": False,  # S/R distance is non-directional
-    "liquidity":   False,  # liquidity is non-directional
+    "momentum":       True,
+    "volatility":     False,
+    "trend_slope":    True,
+    "rsi":            True,
+    "sr_distance":    False,
+    "liquidity":      False,
+    "volume_delta":   True,    # positive delta = more buy volume
+    "spread_norm":    False,   # non-directional
+    "bar_range_ratio":False,   # non-directional
 }
 
 
@@ -118,8 +123,8 @@ class SHAPExplainer:
 
         try:
             X = np.array(X_row, dtype=np.float64).reshape(1, -1)
-            sv = self._explainer.shap_values(X)  # shape (1, 6) or (6,)
-            sv = np.array(sv).flatten()[:6]       # always (6,)
+            sv = self._explainer.shap_values(X)  # shape (1, 9) or (9,)
+            sv = np.array(sv).flatten()[:9]       # always (9,)
 
             # Top feature by absolute SHAP value
             top_idx  = int(np.argmax(np.abs(sv)))

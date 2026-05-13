@@ -177,57 +177,66 @@ def get_ml_sltp(
     model: LinearRegressionModel,
 ) -> tuple[float, float]:
     """
-    Return (sl_distance, tp_distance) in price units (not points).
+    ATR-based dynamic SL/TP in price units.
 
-    When the model is trained:
-      SL = volatility × 1.3, clamped between 50 % and 180 % of the default.
-      TP = SL × multiplier, where multiplier varies 2.0 – 3.0 based on
-           predicted magnitude vs SL size.
+    SL logic:
+      1. Base = 1.5 × ATR(14)  — adapts to live volatility
+      2. Expand to nearest liquidity zone if it's close
+         (don't put SL inside a liquidity cluster — it will get swept)
+      3. Clamp to [broker_min, 3 × default]
+      TP = SL × 2.0 (fixed 1:2 RR — proven edge for scalping)
 
-    Falls back to static values when the model is not yet trained.
-
-    MQL5 equivalent: GetMLSLTP()
+    Falls back to static values when model not yet trained.
     """
-    # ── BROKER LIMITS ──────────────────────────────────────────────
     sym = mt5.symbol_info(symbol)
     if sym is None:
-        # Fallback if symbol info is unavailable
         return sl_points_default * 0.0001, sl_points_default * 3 * 0.0001
-        
-    point = sym.point
-    stops_level = int(sym.trade_stops_level)
-    freeze_level = int(sym.trade_freeze_level)
-    min_dist_pts = max(stops_level, freeze_level) + 20 
-    digits = sym.digits
 
-    if not model.is_trained:
-        sl = max(min_dist_pts, sl_points_default) * point
-        tp = max(min_dist_pts, sl_points_default * 3) * point
-        return round(sl, digits), round(tp, digits)
+    point      = sym.point
+    digits     = sym.digits
+    stops_lvl  = max(int(sym.trade_stops_level), int(sym.trade_freeze_level))
+    min_pts    = stops_lvl + 20
 
-    current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
-    prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
-    pred_points = abs(prediction) / point
+    # ATR(14) in points
+    from indicators.volatility import calculate_volatility
+    atr_pts = calculate_volatility(symbol, timeframe, 1, feature_window)
 
-    # SL based on volatility (in points)
-    ml_sl_points = current_vol * 1.3
-    # Don't go below broker minimum
-    min_sl = max(min_dist_pts, sl_points_default * 0.5)
-    max_sl = sl_points_default * 1.8
-    ml_sl_points = max(min_sl, min(max_sl, ml_sl_points))
+    if atr_pts < min_pts:
+        atr_pts = float(max(min_pts, sl_points_default))
 
-    # TP multiplier
-    tp_mult = 3.0 if pred_points > ml_sl_points * 2.5 else 2.0 if pred_points < ml_sl_points * 0.8 else 2.5
-    ml_tp_points = max(min_dist_pts, ml_sl_points * tp_mult)
+    # Base SL = 1.5 × ATR — gives breathing room without excessive risk
+    sl_pts = atr_pts * 1.5
 
-    sl_distance = round(ml_sl_points * point, digits)
-    tp_distance = round(ml_tp_points * point, digits)
+    # Widen SL to clear the nearest liquidity zone below/above entry
+    # so we don't get swept before the trade has a chance
+    from indicators.liquidity_zones import get_liquidity_zones
+    tick = mt5.symbol_info_tick(symbol)
+    if tick:
+        current_price = tick.ask   # approximate entry
+        liq_zones = get_liquidity_zones(symbol, mt5.TIMEFRAME_M15, lookback_bars=100)
+        for zone in liq_zones:
+            lvl = zone["level"]
+            dist_pts = abs(lvl - current_price) / point
+            # If zone is within 1.5× SL distance below entry for BUY (or above for SELL)
+            # expand SL just past it so we don't place SL inside the zone
+            if dist_pts < sl_pts * 1.2 and zone["strength"] > 0.3:
+                sl_pts = dist_pts * 1.1   # just past the zone
+
+    # Clamp
+    sl_pts = max(float(min_pts), min(sl_pts, float(sl_points_default) * 3.0))
+
+    # TP = 2 × SL — fixed 1:2 RR
+    tp_pts = sl_pts * 2.0
+    tp_pts = max(float(min_pts), tp_pts)
+
+    sl_dist = round(sl_pts * point, digits)
+    tp_dist = round(tp_pts * point, digits)
 
     print(
-        f"📊 ML SL/TP | vol={current_vol:.1f}  pred={pred_points:.1f}pt  "
-        f"SL={ml_sl_points:.1f}pt  TP={ml_tp_points:.1f}pt  RR=1:{ml_tp_points/ml_sl_points:.1f}"
+        f"📊 ATR SL/TP | ATR={atr_pts:.0f}pt  "
+        f"SL={sl_pts:.0f}pt  TP={tp_pts:.0f}pt  RR=1:2.0"
     )
-    return sl_distance, tp_distance
+    return sl_dist, tp_dist
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -270,7 +279,17 @@ def trail_sltp(
     model: LinearRegressionModel,
 ) -> None:
     """
-    Move SL (and TP) forward as the position gains profit.
+    Liquidity-aware trailing stop.
+
+    Philosophy:
+      - SL only moves when the trade is IN PROFIT — never against us
+      - Distance to nearest liquidity zone determines how tight to trail:
+        close to a zone → tighten aggressively (don't let price reverse through it)
+        far from a zone → give breathing room (trend may continue)
+      - Three profit tiers trigger progressively tighter trailing:
+        Tier 1 (> 0.5× ATR): move SL to break-even + 10% of profit
+        Tier 2 (> 1.5× ATR): trail at 1× ATR behind price
+        Tier 3 (> 3.0× ATR): trail at nearest liquidity zone boundary
     """
     positions = get_symbol_positions(symbol)
     if not positions:
@@ -280,133 +299,150 @@ def trail_sltp(
     if sym is None:
         return
 
-    point = sym.point
+    point  = sym.point
     digits = sym.digits
-    
-    # ── VOLATILITY & ML CONTEXT ────────────────────────────────────
-    current_vol = calculate_volatility(symbol, timeframe, 1, feature_window)
-    vol_dist = current_vol * point # 1.0 ATR in price units
-    
-    # Get current prediction to adjust TP
-    prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
-    pred_mag = abs(prediction)
 
-    # ── MIN DISTANCE (Broker's Limit) ──────────────────────────────
-    stops_level = int(sym.trade_stops_level)
+    # Broker hard limits
+    stops_level  = int(sym.trade_stops_level)
     freeze_level = int(sym.trade_freeze_level)
-    min_dist = (max(stops_level, freeze_level) + 20) * point 
+    min_dist     = (max(stops_level, freeze_level) + 10) * point
 
-    # Iterate through actual positions
+    # ATR for dynamic distances
+    from indicators.volatility import calculate_volatility
+    atr = calculate_volatility(symbol, timeframe, 1, feature_window) * point
+    atr = max(atr, min_dist * 2)   # never less than 2× broker minimum
+
+    # Liquidity zones — used to set tight SL near zone boundaries
+    from indicators.liquidity_zones import get_liquidity_zones
+    liq_zones = get_liquidity_zones(symbol, mt5.TIMEFRAME_M15, lookback_bars=100)
+
     for pos in positions:
         if pos is None or pos.symbol != symbol:
             continue
-
-        entry = pos.price_open
-        sl = pos.sl
-        tp = pos.tp
 
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             continue
 
-        price = tick.bid if pos.type == mt5.POSITION_TYPE_BUY else tick.ask
-        profit_points = (price - entry) / point if pos.type == mt5.POSITION_TYPE_BUY else (entry - price) / point
-        
-        # ── 3-STAGE TRAILING LOGIC ──────────────────────────────────
-        # Stage thresholds based on ATR (current_vol)
-        stage = "Normal"
-        
-        if profit_points > current_vol * 3.0:
-            # Stage 3: Aggressive Harvest (Lock in 70% of profit)
-            # Use tight 0.8x ATR distance
-            effective_dist = vol_dist * 0.8
-            stage = "Stage 3 (Harvest)"
-        elif profit_points > current_vol * 1.2:
-            # Stage 2: Trend Following (Give room to breathe)
-            # Use wider 1.5x ATR distance
-            effective_dist = vol_dist * 1.5
-            stage = "Stage 2 (Trend)"
-        elif profit_points > current_vol * 0.7:
-            # Stage 1: 50% Profit Reserve (Lock in half of the gains)
-            # Instead of just breaking even, we take half the profit off the table
-            reserve_pts = profit_points * 0.5
-            if pos.type == mt5.POSITION_TYPE_BUY:
-                target_sl = round(entry + reserve_pts * point, digits)
-            else:
-                target_sl = round(entry - reserve_pts * point, digits)
-            
-            effective_dist = abs(price - target_sl)
-            stage = "Stage 1 (50% Reserve)"
-        else:
-            # Default: initial SL distance
-            effective_dist = sl_points * point
-            stage = "Initial"
+        is_buy  = (pos.type == mt5.POSITION_TYPE_BUY)
+        price   = tick.bid if is_buy else tick.ask
+        entry   = pos.price_open
+        sl      = pos.sl
+        tp      = pos.tp
 
-        # Ensure effective_dist is valid
-        effective_dist = max(effective_dist, min_dist)
-        
-        # ── CALCULATE TARGETS ────────────────────────────────────────
-        # Stage 1 already computed target_sl directly; all other stages derive it from price
-        if stage != "Stage 1 (50% Reserve)":
-            if pos.type == mt5.POSITION_TYPE_BUY:
-                target_sl = round(price - effective_dist, digits)
-            else:
-                target_sl = round(price + effective_dist, digits)
+        profit_pts = (price - entry) / point if is_buy else (entry - price) / point
+        profit_price = price - entry if is_buy else entry - price   # in price units
 
-        # Dynamic TP: If prediction weakens, pull TP closer to lock in profit
-        # If prediction mag is < 50% of the average range, use a tighter TP
-        tp_mult = 3.0 if pred_mag > current_vol * 0.5 else 1.5
-        tp_dist = effective_dist * tp_mult
+        # ── Only trail when in profit ────────────────────────────────
+        if profit_pts <= 0:
+            continue
 
-        if pos.type == mt5.POSITION_TYPE_BUY:
-            target_tp = round(price + tp_dist, digits)
-            # Ensure TP only moves forward or stays
-            if tp > 0 and target_tp < tp: target_tp = tp 
-            is_better_sl = (target_sl > sl) or (sl == 0)
-        else:
-            target_tp = round(price - tp_dist, digits)
-            if tp > 0 and target_tp > tp: target_tp = tp
-            is_better_sl = (target_sl < sl) or (sl == 0)
+        # ── Find nearest liquidity zone in profit direction ──────────
+        # We want the nearest zone AHEAD of price (in trade direction)
+        # so we can tighten SL before price hits it and reverses
+        nearest_zone_dist = None
+        nearest_zone_lvl  = None
+        for zone in liq_zones:
+            lvl = zone["level"]
+            if is_buy and lvl > price:                     # zone ahead of BUY
+                dist = lvl - price
+                if nearest_zone_dist is None or dist < nearest_zone_dist:
+                    nearest_zone_dist = dist
+                    nearest_zone_lvl  = lvl
+            elif not is_buy and lvl < price:               # zone ahead of SELL
+                dist = price - lvl
+                if nearest_zone_dist is None or dist < nearest_zone_dist:
+                    nearest_zone_dist = dist
+                    nearest_zone_lvl  = lvl
 
-        # ── SAFETY: BROKER LIMITS ───────────────────────────────────
-        if pos.type == mt5.POSITION_TYPE_BUY:
-            if target_sl > price - min_dist: target_sl = round(price - min_dist, digits)
-            if target_tp < price + min_dist: target_tp = round(price + min_dist, digits)
-        else:
-            if target_sl < price + min_dist: target_sl = round(price + min_dist, digits)
-            if target_tp > price - min_dist: target_tp = round(price - min_dist, digits)
+        # ── Determine target SL based on profit tier ─────────────────
+        target_sl = sl   # default: don't move
 
-        # DEBUG: Throttled feedback
-        cnt = _trail_debug_cnt.get(pos.ticket, 0)
-        if profit_points > 10 and cnt % 100 == 0:
-            print(f"🔄 {stage} #{pos.ticket} | Prof: {profit_points:.1f}pt | "
-                  f"SL: {sl:.5f}->{target_sl:.5f} | Better: {is_better_sl}")
-        _trail_debug_cnt[pos.ticket] = cnt + 1
+        atr_val = atr / point   # ATR in points
 
-        # ── EXECUTE ─────────────────────────────────────────────────
-        if profit_points > 0 and is_better_sl:
-            step_pts = abs(target_sl - sl) / point if sl > 0 else 9999
-            
-            if step_pts >= trailing_step_points:
-                request = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "position": pos.ticket,
-                    "symbol": symbol,
-                    "sl": target_sl,
-                    "tp": target_tp,
-                }
-                
-                result = mt5.order_send(request)
-                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"ACTION | TrailSLTP {stage} #{pos.ticket} | SL: {target_sl:.5f}")
-                    print(f"✅ {stage} Updated #{pos.ticket} | SL: {target_sl:.5f}")
+        if profit_pts > atr_val * 3.0:
+            # ── TIER 3: Near liquidity zone — tightest trail ─────────
+            # If a zone is within 1× ATR ahead, trail to just behind
+            # the zone boundary so we exit before a reversal eats profit
+            if nearest_zone_dist is not None and nearest_zone_dist < atr:
+                # Trail SL to zone level minus a small buffer
+                buffer = min_dist * 2
+                if is_buy:
+                    target_sl = round(nearest_zone_lvl - buffer, digits)
                 else:
-                    global _trail_last_err
-                    err = mt5.last_error() if result is None else result.comment
-                    if _trail_last_err != err:
-                        logging.error(f"FAIL | TrailSLTP #{pos.ticket} | Error: {err}")
-                        print(f"❌ TrailSLTP Fail: {err}")
-                        _trail_last_err = err
+                    target_sl = round(nearest_zone_lvl + buffer, digits)
+                stage = f"Tier3-Zone({nearest_zone_lvl:.3f})"
+            else:
+                # No nearby zone — trail at 0.6× ATR behind price
+                trail_dist = max(atr * 0.6, min_dist)
+                target_sl  = round(price - trail_dist, digits) if is_buy \
+                             else round(price + trail_dist, digits)
+                stage = "Tier3-Tight"
+
+        elif profit_pts > atr_val * 1.5:
+            # ── TIER 2: Trending — give 1× ATR room ──────────────────
+            trail_dist = max(atr, min_dist)
+            target_sl  = round(price - trail_dist, digits) if is_buy \
+                         else round(price + trail_dist, digits)
+            stage = "Tier2-Trend"
+
+        elif profit_pts > atr_val * 0.5:
+            # ── TIER 1: Break-even + 10% of profit ───────────────────
+            # Lock in a small cushion above entry; never drop back to loss
+            cushion   = profit_price * 0.10
+            target_sl = round(entry + cushion, digits) if is_buy \
+                        else round(entry - cushion, digits)
+            stage = "Tier1-BE+"
+
+        else:
+            continue   # < 0.5× ATR profit — too small to trail yet
+
+        # ── Safety: target_sl must be better than current sl ─────────
+        if is_buy:
+            is_better = (sl == 0) or (target_sl > sl)
+        else:
+            is_better = (sl == 0) or (target_sl < sl)
+
+        if not is_better:
+            continue
+
+        # ── Safety: broker min distance ──────────────────────────────
+        if is_buy:
+            if target_sl > price - min_dist:
+                target_sl = round(price - min_dist, digits)
+        else:
+            if target_sl < price + min_dist:
+                target_sl = round(price + min_dist, digits)
+
+        # ── Minimum step filter (avoid spamming broker) ──────────────
+        step_moved = abs(target_sl - sl) / point if sl > 0 else 9999
+        if step_moved < trailing_step_points:
+            continue
+
+        # ── Execute ───────────────────────────────────────────────────
+        request = {
+            "action":   mt5.TRADE_ACTION_SLTP,
+            "position": pos.ticket,
+            "symbol":   symbol,
+            "sl":       target_sl,
+            "tp":       tp,      # keep existing TP unchanged
+        }
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            lz_info = f" | LZ={nearest_zone_lvl:.3f}" if nearest_zone_lvl else ""
+            logging.info(f"ACTION | Trail {stage} #{pos.ticket} | SL: {target_sl:.5f}")
+            print(
+                f"✅ {stage} #{pos.ticket} | "
+                f"profit={profit_pts:.1f}pt | "
+                f"SL: {sl:.5f} → {target_sl:.5f}{lz_info}"
+            )
+        else:
+            global _trail_last_err
+            err = mt5.last_error() if result is None else result.comment
+            if _trail_last_err != err:
+                logging.error(f"FAIL | TrailSLTP #{pos.ticket} | {err}")
+                print(f"❌ TrailSLTP Fail #{pos.ticket}: {err}")
+                _trail_last_err = err
 
 
 

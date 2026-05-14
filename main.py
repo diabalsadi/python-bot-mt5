@@ -3,6 +3,26 @@ Gold Scalper — Python Edition
 =================================
 Main entry point.  Mirrors the MQL5 EA's OnInit() + OnTick() loop.
 
+Feature Pipeline (CRITICAL):
+  Raw Market Data
+    ↓
+  Feature Engineering (ml/features.py)
+    ↓
+  Normalization (using config/feature_stats.py)
+    ↓
+  Feature Clipping [-5, 5] (utils/normalization.py)
+    ↓
+  Trade Validation (risk/trade_filters.py)
+    ↓
+  ML Prediction (ml/model.py)
+    ↓
+  RL Gating (ml/rl_agent.py)
+    ↓
+  Execution (actions/strategy.py)
+
+All features are normalized BEFORE ML inference using historical mean/std.
+This prevents exploding features (e.g., rsi=1767, spread_norm=-2105).
+
 Run:
     python main.py
 """
@@ -15,6 +35,8 @@ from typing import Optional
 
 import MetaTrader5 as mt5
 import numpy as np
+
+from risk.trade_filters import TradeFilter
 
 logging.basicConfig(
     filename="latency.log",
@@ -58,10 +80,10 @@ from tools.trade_logger import TradeLogger
 # Configuration  (mirrors MQL5 input block)
 # ──────────────────────────────────────────────────────────────────────
 SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSDm")
-TIMEFRAME = mt5.TIMEFRAME_M1
+TIMEFRAME = mt5.TIMEFRAME_M5
 
-# ML — short-term model (M1, last 150 bars for fast adaptation)
-ML_TRAINING_BARS = 1440  # 24 hour of m1 candles
+# ML — short-term model (M5, last 1440 bars = 5 days of data)
+ML_TRAINING_BARS = 1440  # 5 days of M5 candles
 ML_FEATURE_WINDOW = 12
 ML_RETRAIN_INTERVAL = 10  # bars between retrains
 ML_PREDICTION_HORIZON = 15
@@ -83,7 +105,7 @@ ATR_PERIOD = 14
 TREND_BARS = 15
 
 # Risk / order management
-SL_POINTS = 2000
+SL_POINTS = 4000
 RISK_PERCENT = 10.0
 TRAILING_STEP_POINTS = 300
 EXPIRATION_HOURS = 50
@@ -115,14 +137,18 @@ SR_LOOKBACK_BARS = 50  # Bars used to detect S/R levels
 # ──────────────────────────────────────────────────────────────────────
 # State
 # ──────────────────────────────────────────────────────────────────────
-model = LinearRegressionModel()  # short-term M1 model
-mid_model = LinearRegressionModel()  # medium-term M5 model
-long_model = LinearRegressionModel()  # long-term H1 model (3 months)
+model = LinearRegressionModel()      # short-term M5 model
+mid_model = LinearRegressionModel()  # medium-term M15 model
+long_model = LinearRegressionModel() # long-term H1 model (3 months)
 
 # RL gating agent
 rl_agent = RLAgent(weights_path="rl_weights.npz")
+rl_agent.train_from_csv("trades.csv", epochs=5)  # Continuously learn from historical trades on every startup
 _last_rl_state: Optional[np.ndarray] = None
 _last_rl_action: int = 0
+
+# Trade filter for risk validation
+trade_filter = TradeFilter()
 total_bars = 0
 ml_train_counter = 0
 mid_train_counter = 0
@@ -596,53 +622,161 @@ def on_tick() -> None:
         if int(now_ts_entry) % 60 < 2:
             print(f"🚫 Abnormal bar range ({bar_range:.2f}×) — news/spike, skipping")
 
-    if buy_level > 0 and buy_allowed:
-        rl_action, rl_reason = rl_agent.act_verbose(_last_rl_state, ml_action=1)
-        _last_rl_action = rl_action
-        if rl_action == 1:
-            execute_buy_market(SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD, RISK_PERCENT, model)
+    # Extract features for trade validation
+    features = get_features(
+        SYMBOL,
+        TIMEFRAME,
+        0,
+        ML_FEATURE_WINDOW,
+        RSI_PERIOD,
+    )
+
+    (
+        momentum,
+        volatility,
+        trend,
+        rsi,
+        sr_distance,
+        liquidity,
+        volume_delta,
+        spread_norm_feat,
+        bar_range_ratio,
+    ) = features
+
+    # ── Check for new closed candle ────────────────────────────────
+    current_bar = int(current_rates[0]["time"])
+    if current_bar == last_bar_time:
+        # Still on same candle — skip trading
+        pass
+    else:
+        # New candle closed — now we can trade once
+        last_bar_time = current_bar
+
+        # ── Build bullish/bearish signal ──────────────────────────
+        bullish = 0
+        bearish = 0
+
+        if momentum > 0:
+            bullish += 1
         else:
-            print(f"🤖 RL HOLD (blocked BUY) | {rl_reason}")
+            bearish += 1
 
-    if sell_level > 0 and sell_allowed:
-        rl_action, rl_reason = rl_agent.act_verbose(_last_rl_state, ml_action=2)
-        _last_rl_action = rl_action
-        if rl_action == 2:
-            execute_sell_market(SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD, RISK_PERCENT, model)
+        if trend > 0:
+            bullish += 1
         else:
-            print(f"🤖 RL HOLD (blocked SELL) | {rl_reason}")
+            bearish += 1
 
-    # 6e. Place Fibonacci orders
-    fibo_levels = get_m30_fibo_levels(SYMBOL)
-    if fibo_levels:
-        is_bullish = fibo_levels.get("is_bullish", False)
-        # If prediction is positive and M30 bar was bullish (retracing down for support)
-        if prediction > 0 and is_bullish:
-            for level_name in ["pullback_50", "pullback_61"]:
-                if level_name in fibo_levels:
-                    execute_buy_market(
-                        SYMBOL,
-                        TIMEFRAME,
-                        SL_POINTS,
-                        ML_FEATURE_WINDOW,
-                        RSI_PERIOD,
-                        RISK_PERCENT / 2.0,  # Risk half on fibo entries
-                        model,
-                    )
+        if rsi > 0:
+            bullish += 1
+        else:
+            bearish += 1
 
-        # If prediction is negative and M30 bar was bearish (retracing up for resistance)
-        elif prediction < 0 and not is_bullish:
-            for level_name in ["pullback_50", "pullback_61"]:
-                if level_name in fibo_levels:
-                    execute_sell_market(
-                        SYMBOL,
-                        TIMEFRAME,
-                        SL_POINTS,
-                        ML_FEATURE_WINDOW,
-                        RSI_PERIOD,
-                        RISK_PERCENT / 2.0,  # Risk half on fibo entries
-                        model,
-                    )
+        if volume_delta > 0:
+            bullish += 1
+        else:
+            bearish += 1
+
+        if bullish >= 3:
+            signal = "BUY"
+        elif bearish >= 3:
+            signal = "SELL"
+        else:
+            signal = "NONE"
+
+        if show_analysis:
+            print(f"📊 Signal: {signal} | Bullish: {bullish} | Bearish: {bearish}")
+
+        # ── Only trade if signal aligns with direction ─────────────
+        if buy_level > 0 and buy_allowed and signal == "BUY":
+            # Validate trade with TradeFilter before execution
+            trade_check = trade_filter.validate(
+                spread_norm=spread_norm_feat,
+                bar_range_ratio=bar_range_ratio,
+                liquidity_score=liquidity,
+                volatility=volatility,
+            )
+
+            if not trade_check.allowed:
+                print(f"TRADE BLOCKED (BUY): {trade_check.reason}")
+            else:
+                rl_action, rl_reason = rl_agent.act_verbose(_last_rl_state, ml_action=1)
+                _last_rl_action = rl_action
+                if rl_action == 1:
+                    execute_buy_market(SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD, RISK_PERCENT, model)
+                else:
+                    print(f"🤖 RL HOLD (blocked BUY) | {rl_reason}")
+        elif buy_level > 0 and buy_allowed and signal != "BUY":
+            print(f"🚫 BUY blocked: signal={signal} (need BUY signal)")
+
+        if sell_level > 0 and sell_allowed and signal == "SELL":
+            # Validate trade with TradeFilter before execution
+            trade_check = trade_filter.validate(
+                spread_norm=spread_norm_feat,
+                bar_range_ratio=bar_range_ratio,
+                liquidity_score=liquidity,
+                volatility=volatility,
+            )
+
+            if not trade_check.allowed:
+                print(f"TRADE BLOCKED (SELL): {trade_check.reason}")
+            else:
+                rl_action, rl_reason = rl_agent.act_verbose(_last_rl_state, ml_action=2)
+                _last_rl_action = rl_action
+                if rl_action == 2:
+                    execute_sell_market(SYMBOL, TIMEFRAME, SL_POINTS, ML_FEATURE_WINDOW, RSI_PERIOD, RISK_PERCENT, model)
+                else:
+                    print(f"🤖 RL HOLD (blocked SELL) | {rl_reason}")
+        elif sell_level > 0 and sell_allowed and signal != "SELL":
+            print(f"🚫 SELL blocked: signal={signal} (need SELL signal)")
+
+        # 6e. Place Fibonacci orders
+        fibo_levels = get_m30_fibo_levels(SYMBOL)
+        if fibo_levels:
+            is_bullish = fibo_levels.get("is_bullish", False)
+            
+            # Validate trade before Fibonacci execution
+            trade_check = trade_filter.validate(
+                spread_norm=spread_norm_feat,
+                bar_range_ratio=bar_range_ratio,
+                liquidity_score=liquidity,
+                volatility=volatility,
+            )
+            
+            # If prediction is positive and M30 bar was bullish (retracing down for support)
+            if prediction > 0 and is_bullish and trade_check.allowed and signal == "BUY":
+                for level_name in ["pullback_50", "pullback_61"]:
+                    if level_name in fibo_levels:
+                        execute_buy_market(
+                            SYMBOL,
+                            TIMEFRAME,
+                            SL_POINTS,
+                            ML_FEATURE_WINDOW,
+                            RSI_PERIOD,
+                            RISK_PERCENT / 2.0,  # Risk half on fibo entries
+                            model,
+                        )
+            elif prediction > 0 and is_bullish and not trade_check.allowed:
+                print(f"TRADE BLOCKED (Fibo BUY): {trade_check.reason}")
+            elif prediction > 0 and is_bullish and signal != "BUY":
+                print(f"🚫 Fibo BUY blocked: signal={signal} (need BUY signal)")
+
+            # If prediction is negative and M30 bar was bearish (retracing up for resistance)
+            if prediction < 0 and not is_bullish and trade_check.allowed and signal == "SELL":
+                for level_name in ["pullback_50", "pullback_61"]:
+                    if level_name in fibo_levels:
+                        execute_sell_market(
+                            SYMBOL,
+                            TIMEFRAME,
+                            SL_POINTS,
+                            ML_FEATURE_WINDOW,
+                            RSI_PERIOD,
+                            RISK_PERCENT / 2.0,  # Risk half on fibo entries
+                            model,
+                        )
+            elif prediction < 0 and not is_bullish and not trade_check.allowed:
+                print(f"TRADE BLOCKED (Fibo SELL): {trade_check.reason}")
+            elif prediction < 0 and not is_bullish and signal != "SELL":
+                print(f"🚫 Fibo SELL blocked: signal={signal} (need SELL signal)")
 
     # 7. Trail SL/TP every tick
     positions = mt5.positions_get(symbol=SYMBOL)
@@ -654,10 +788,7 @@ def on_tick() -> None:
         SYMBOL,
         TIMEFRAME,
         TRAILING_STEP_POINTS,
-        SL_POINTS,
         ML_FEATURE_WINDOW,
-        RSI_PERIOD,
-        model,
     )
 
     # Flush any closed deals to trades.csv

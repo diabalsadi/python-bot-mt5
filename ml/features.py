@@ -1,79 +1,123 @@
 """
-ML Feature Extraction  (v2 — 9 features)
------------------------------------------
-Features fed to XGBoost and used to build the RL state.
+Feature extraction and normalization for ML model.
 
-Feature map:
-  x1  momentum          — price rate-of-change over feature_window
-  x2  volatility        — std of last 14 closes
-  x3  trend_slope       — linear slope over feature_window
-  x4  rsi               — RSI(14) [0-100]
-  x5  sr_distance       — normalised distance to nearest S/R [-1, +1]
-  x6  liquidity_score   — swing-point density near price [0, 1]
-  x7  volume_delta      — tick-volume buy/sell pressure [-1, +1]  ← NEW
-  x8  spread_norm       — spread / ATR(14)  [0, 5]               ← NEW
-  x9  bar_range_ratio   — current range / 20-bar avg range        ← NEW
+CRITICAL: All features are normalized before returning to prevent
+the "exploding features" problem (rsi=1767, spread_norm=-2105, etc.).
 
-x7–x9 give XGBoost order-flow context the price chart alone can't see.
-High spread_norm (>1) or bar_range_ratio (>2) are hard "don't trade" signals.
+Normalization process:
+  1. Calculate raw feature value
+  2. Subtract historical mean
+  3. Divide by historical std
+  4. Clip to [-5, 5] to prevent outliers
+
+This must match training and inference exactly.
 """
 
+import numpy as np
 import MetaTrader5 as mt5
-
-from indicators.momentum           import calculate_momentum
-from indicators.volatility         import calculate_volatility
-from indicators.trend              import calculate_trend
-from indicators.rsi                import calculate_rsi
+from indicators.liquidity_zones import calculate_liquidity_score
+from indicators.momentum import calculate_momentum
+from indicators.order_flow import calculate_bar_range_ratio, calculate_spread_norm, calculate_volume_delta
+from indicators.rsi import calculate_rsi
 from indicators.support_resistance import calculate_sr_distance
-from indicators.liquidity_zones    import calculate_liquidity_score
-from indicators.order_flow         import (
-    calculate_volume_delta,
-    calculate_spread_norm,
-    calculate_bar_range_ratio,
-)
-
-FEATURE_NAMES = [
-    "momentum",
-    "volatility",
-    "trend_slope",
-    "rsi",
-    "sr_distance",
-    "liquidity",
-    "volume_delta",
-    "spread_norm",
-    "bar_range_ratio",
-]
+from indicators.trend import calculate_trend
+from indicators.volatility import calculate_volatility
+from utils.normalization import robust_normalize
+from config.feature_stats import FEATURE_STATS
 
 
 def get_features(
-    symbol: str,
-    timeframe: int,
-    shift: int,
-    feature_window: int,
-    rsi_period: int,
-) -> tuple[float, float, float, float, float, float, float, float, float]:
+    symbol,
+    timeframe,
+    shift,
+    feature_window,
+    rsi_period,
+):
     """
-    Return the 9 ML input features evaluated `shift` bars ago.
-
-    Args:
-        symbol:         Trading symbol
-        timeframe:      MT5 timeframe constant (primary, e.g. M1)
-        shift:          Bar offset (0 = forming bar, 1 = last closed)
-        feature_window: Look-back for momentum / volatility / trend
-        rsi_period:     RSI calculation period
-
-    Returns:
-        (momentum, volatility, trend_slope, rsi, sr_distance,
-         liquidity, volume_delta, spread_norm, bar_range_ratio)
+    Extract and normalize all 9 features for ML model.
+    
+    Returns tuple of 9 normalized features:
+    (momentum, volatility, trend, rsi, sr_distance, liquidity, volume_delta, spread_norm, bar_range_ratio)
+    
+    All values are in range [-5, 5] after robust normalization.
     """
-    x1 = calculate_momentum(symbol, timeframe, shift, feature_window)
-    x2 = calculate_volatility(symbol, timeframe, shift, feature_window)
-    x3 = calculate_trend(symbol, timeframe, shift, feature_window)
-    x4 = calculate_rsi(symbol, timeframe, shift, rsi_period)
-    x5 = calculate_sr_distance(symbol, mt5.TIMEFRAME_M15, shift, lookback_bars=50)
-    x6 = calculate_liquidity_score(symbol, mt5.TIMEFRAME_M15, shift, lookback_bars=50)
-    x7 = calculate_volume_delta(symbol, timeframe, shift, feature_window)
-    x8 = calculate_spread_norm(symbol, timeframe, shift)
-    x9 = calculate_bar_range_ratio(symbol, timeframe, shift)
+    
+    # Raw feature calculations
+    momentum_raw = calculate_momentum(symbol, timeframe, shift, feature_window)
+    volatility_raw = calculate_volatility(symbol, timeframe, shift, feature_window)
+    trend_raw = calculate_trend(symbol, timeframe, shift, feature_window)
+    rsi_raw = (calculate_rsi(symbol, timeframe, shift, rsi_period) - 50) / 10
+    sr_distance_raw = calculate_sr_distance(symbol, mt5.TIMEFRAME_M15, shift, 50)
+    liquidity_raw = calculate_liquidity_score(symbol, mt5.TIMEFRAME_M15, shift, 50)
+    volume_delta_raw = calculate_volume_delta(symbol, timeframe, shift, feature_window)
+    spread_norm_raw = calculate_spread_norm(symbol, timeframe, shift)
+    bar_range_ratio_raw = calculate_bar_range_ratio(symbol, timeframe, shift)
 
-    return x1, x2, x3, x4, x5, x6, x7, x8, x9
+    # Normalize using historical mean/std from config
+    stats = FEATURE_STATS
+    
+    momentum = robust_normalize(
+        momentum_raw,
+        stats["momentum"]["mean"],
+        stats["momentum"]["std"]
+    )
+    
+    volatility = robust_normalize(
+        volatility_raw,
+        stats["volatility"]["mean"],
+        stats["volatility"]["std"]
+    )
+    
+    trend = robust_normalize(
+        trend_raw,
+        stats["trend"]["mean"],
+        stats["trend"]["std"]
+    )
+    
+    rsi = robust_normalize(
+        rsi_raw,
+        stats["rsi"]["mean"],
+        stats["rsi"]["std"]
+    )
+    
+    sr_distance = robust_normalize(
+        sr_distance_raw,
+        stats["sr_distance"]["mean"],
+        stats["sr_distance"]["std"]
+    )
+    
+    liquidity = robust_normalize(
+        liquidity_raw,
+        stats["liquidity"]["mean"],
+        stats["liquidity"]["std"]
+    )
+    
+    volume_delta = robust_normalize(
+        volume_delta_raw,
+        stats["volume_delta"]["mean"],
+        stats["volume_delta"]["std"]
+    )
+    
+    spread_norm = robust_normalize(
+        spread_norm_raw,
+        stats["spread_norm"]["mean"],
+        stats["spread_norm"]["std"]
+    )
+    
+    bar_range_ratio = robust_normalize(
+        bar_range_ratio_raw,
+        stats["bar_range_ratio"]["mean"],
+        stats["bar_range_ratio"]["std"]
+    )
+
+    return (
+        momentum,
+        volatility,
+        trend,
+        rsi,
+        sr_distance,
+        liquidity,
+        volume_delta,
+        spread_norm,
+        bar_range_ratio,
+    )

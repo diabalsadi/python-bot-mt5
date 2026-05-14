@@ -273,10 +273,7 @@ def trail_sltp(
     symbol: str,
     timeframe: int,
     trailing_step_points: int,
-    sl_points: int,
     feature_window: int,
-    rsi_period: int,
-    model: LinearRegressionModel,
 ) -> None:
     """
     Liquidity-aware trailing stop.
@@ -360,6 +357,14 @@ def trail_sltp(
 
         atr_val = atr / point   # ATR in points
 
+        # New behaviour:
+        #  - Move SL to break-even (entry + small cushion) at a low threshold
+        #    so profitable trades secure at least their entry.
+        #  - After break-even is set, start trailing to lock-in profit
+        # Tier thresholds (in multiples of ATR):
+        #  BE_THRESHOLD: small multiplier to secure BE quickly
+        BE_THRESHOLD = max(1.0, atr_val * 0.15)
+
         if profit_pts > atr_val * 3.0:
             # ── TIER 3: Near liquidity zone — tightest trail ─────────
             # If a zone is within 1× ATR ahead, trail to just behind
@@ -379,20 +384,19 @@ def trail_sltp(
                              else round(price + trail_dist, digits)
                 stage = "Tier3-Tight"
 
-        elif profit_pts > atr_val * 1.5:
+        elif profit_pts > atr_val * 1.0:
             # ── TIER 2: Trending — give 1× ATR room ──────────────────
             trail_dist = max(atr, min_dist)
             target_sl  = round(price - trail_dist, digits) if is_buy \
                          else round(price + trail_dist, digits)
             stage = "Tier2-Trend"
-
-        elif profit_pts > atr_val * 0.5:
-            # ── TIER 1: Break-even + 10% of profit ───────────────────
-            # Lock in a small cushion above entry; never drop back to loss
-            cushion   = profit_price * 0.10
+        elif profit_pts > BE_THRESHOLD:
+            # ── TIER 1: Move first to break-even (small cushion)
+            # Lock in break-even + tiny cushion so SL never returns to loss.
+            cushion   = max(profit_price * 0.05, point * 10)  # fixed small tick buffer
             target_sl = round(entry + cushion, digits) if is_buy \
                         else round(entry - cushion, digits)
-            stage = "Tier1-BE+"
+            stage = "Tier1-BE"
 
         else:
             continue   # < 0.5× ATR profit — too small to trail yet
@@ -414,9 +418,11 @@ def trail_sltp(
             if target_sl < price + min_dist:
                 target_sl = round(price + min_dist, digits)
 
-        # ── Minimum step filter (avoid spamming broker) ──────────────
+        # ── Minimum step filter (avoid spamming broker)
+        # Allow small moves for Tier1 (break-even) to secure entry even
+        # if the movement is smaller than the configured step.
         step_moved = abs(target_sl - sl) / point if sl > 0 else 9999
-        if step_moved < trailing_step_points:
+        if step_moved < trailing_step_points and not str(stage).startswith("Tier1"):
             continue
 
         # ── Execute ───────────────────────────────────────────────────
@@ -802,7 +808,17 @@ def execute_buy_market(
     tp = round(entry + tp_dist, digits)
 
     sl_pts = int(sl_dist / point)
-    lot = calculate_lot_size(symbol, sl_pts, risk_percent)
+    
+    prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
+    from indicators.volatility import calculate_volatility
+    atr = calculate_volatility(symbol, timeframe, 1, feature_window)
+    
+    confidence_mult = 1.0
+    if prediction > atr * 1.5:
+        confidence_mult = 5.0
+        print(f"🔥 HIGH CONFIDENCE BUY: pred ({prediction:.3f}) > 1.5x ATR ({atr:.3f}) → 5x Risk!")
+        
+    lot = calculate_lot_size(symbol, sl_pts, risk_percent * confidence_mult)
 
     print(f"🟦 BUY MARKET → entry={entry:.5f}  SL={sl:.5f}  TP={tp:.5f}  lot={lot}")
 
@@ -831,7 +847,7 @@ def execute_buy_market(
         try:
             shap_res = model.shap.explain(
                 np.array(get_features(symbol, timeframe, 0, feature_window, rsi_period)),
-                prediction=model.predict(symbol, timeframe, feature_window, rsi_period),
+                prediction=prediction,
             ) if model.shap.is_fitted else None
         except Exception as e:
             print(f"⚠️  SHAP explain error (non-fatal): {e}")
@@ -892,7 +908,17 @@ def execute_sell_market(
     tp = round(entry - tp_dist, digits)
 
     sl_pts = int(sl_dist / point)
-    lot = calculate_lot_size(symbol, sl_pts, risk_percent)
+    
+    prediction = model.predict(symbol, timeframe, feature_window, rsi_period)
+    from indicators.volatility import calculate_volatility
+    atr = calculate_volatility(symbol, timeframe, 1, feature_window)
+    
+    confidence_mult = 1.0
+    if prediction < -atr * 1.5:
+        confidence_mult = 5.0
+        print(f"🔥 HIGH CONFIDENCE SELL: pred ({prediction:.3f}) < -1.5x ATR ({-atr:.3f}) → 5x Risk!")
+        
+    lot = calculate_lot_size(symbol, sl_pts, risk_percent * confidence_mult)
 
     print(f"🟥 SELL MARKET → entry={entry:.5f}  SL={sl:.5f}  TP={tp:.5f}  lot={lot}")
 
@@ -922,7 +948,7 @@ def execute_sell_market(
         try:
             shap_res = model.shap.explain(
                 np.array(get_features(symbol, timeframe, 0, feature_window, rsi_period)),
-                prediction=model.predict(symbol, timeframe, feature_window, rsi_period),
+                prediction=prediction,
             ) if model.shap.is_fitted else None
         except Exception as e:
             print(f"⚠️  SHAP explain error (non-fatal): {e}")

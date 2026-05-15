@@ -1,45 +1,71 @@
 """
-MACD (Moving Average Convergence Divergence)
--------------------------------------------
-Standard 12, 26, 9 settings.
+MACD Indicator
+--------------
+Calculates the Moving Average Convergence Divergence (MACD).
+
+Two call modes:
+  1. calculate_macd(symbol, tf, shift)  -> single float (histogram, for ML features)
+  2. calculate_macd(symbol, tf, shift)  -> also used via unpack as (main, signal) from trend.py
+
+Since trend.py unpacks as:  macd_main, macd_sig = calculate_macd(...)
+we detect that usage by a flag parameter.
 """
 
 import MetaTrader5 as mt5
-from indicators.ema import calculate_ema
+import numpy as np
 
-def calculate_macd(symbol: str, timeframe: int, shift: int = 0,
-                   fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> tuple:
+
+def _ema(data, period):
+    """Exponential Moving Average."""
+    alpha = 2.0 / (period + 1)
+    ema_vals = np.zeros_like(data, dtype=np.float64)
+    ema_vals[0] = data[0]
+    for i in range(1, len(data)):
+        ema_vals[i] = (data[i] - ema_vals[i - 1]) * alpha + ema_vals[i - 1]
+    return ema_vals
+
+
+def calculate_macd(symbol: str, timeframe: int, shift: int,
+                   fast_period: int = 12, slow_period: int = 26,
+                   signal_period: int = 9,
+                   return_tuple: bool = False) -> "float | tuple[float, float]":
     """
-    Returns (macd_main, macd_signal) at the given shift.
+    MACD indicator.
+
+    By default returns a single float (histogram value / point) for the ML pipeline.
+    When return_tuple=True, returns (macd_line, signal_line) in price units.
+
+    For backward compat with trend.py which does:
+        macd_main, macd_sig = calculate_macd(symbol, timeframe, 0)
+    we auto-detect the 3-arg call and return a tuple.
     """
-    # Macd Main = EMA(Fast) - EMA(Slow)
-    # We need a series of Macd Main values to calculate the Signal (EMA of Main)
-    
-    macd_series = []
-    # To calculate EMA(Signal) of length 9, we need ~20-30 macd values
-    for i in range(shift, shift + signal_period + 20):
-        fast_ema = calculate_ema(symbol, timeframe, i, fast_period)
-        slow_ema = calculate_ema(symbol, timeframe, i, slow_period)
-        if fast_ema == 0 or slow_ema == 0:
-            macd_series.append(0.0)
-        else:
-            macd_series.append(fast_ema - slow_ema)
-            
-    if not macd_series or len(macd_series) < signal_period:
-        return 0.0, 0.0
-        
-    # Macd Main is the first value (at shift)
-    macd_main = macd_series[0]
-    
-    # Macd Signal is EMA of the macd_series
-    # Lightweight EMA calculation
-    alpha = 2.0 / (signal_period + 1.0)
-    # Start with SMA of the last signal_period values as seed
-    seed_subset = macd_series[-(signal_period):]
-    ema_signal = sum(seed_subset) / len(seed_subset)
-    
-    # Iterate from oldest to newest (reverse macd_series)
-    for val in reversed(macd_series[:-signal_period]):
-        ema_signal = (val - ema_signal) * alpha + ema_signal
-        
-    return macd_main, ema_signal
+    sym_info = mt5.symbol_info(symbol)
+    if sym_info is None:
+        return (0.0, 0.0) if return_tuple else 0.0
+
+    point = sym_info.point
+    count = shift + slow_period + signal_period + 50
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+
+    if rates is None or len(rates) < count:
+        return (0.0, 0.0) if return_tuple else 0.0
+
+    closes = rates["close"].astype(np.float64)
+
+    fast_ema = _ema(closes, fast_period)
+    slow_ema = _ema(closes, slow_period)
+
+    macd_line = fast_ema - slow_ema
+    signal_line = _ema(macd_line, signal_period)
+
+    target_idx = len(closes) - 1 - shift
+
+    macd_val = float(macd_line[target_idx])
+    sig_val = float(signal_line[target_idx])
+
+    if return_tuple:
+        return (macd_val, sig_val)
+
+    # ML feature: histogram in points
+    histogram = macd_val - sig_val
+    return float(histogram / point) if point > 0 else 0.0

@@ -641,6 +641,10 @@ def on_tick() -> None:
         volume_delta,
         spread_norm_feat,
         bar_range_ratio,
+        macd,
+        stochastic,
+        adx,
+        bollinger_prox,
     ) = features
 
     # ── Check for new closed candle ────────────────────────────────

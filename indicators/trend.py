@@ -110,7 +110,7 @@ def get_technical_trend(
     # 4. MOMENTUM (RSI & STOCHASTIC & MACD)
     rsi = calculate_rsi(symbol, timeframe, 0, rsi_period)
     stoch_k, stoch_d = calculate_stochastic(symbol, timeframe, 0, 13, 8, 8)
-    macd_main, macd_sig = calculate_macd(symbol, timeframe, 0)
+    macd_main, macd_sig = calculate_macd(symbol, timeframe, 0, return_tuple=True)
 
     # ── CONFLUENCE LOGIC ───────────────────────────────────────────
     

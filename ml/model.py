@@ -60,6 +60,10 @@ class LinearRegressionModel:
         self.beta7: float = 0.0   # volume_delta
         self.beta8: float = 0.0   # spread_norm
         self.beta9: float = 0.0   # bar_range_ratio
+        self.beta10: float = 0.0  # macd
+        self.beta11: float = 0.0  # stochastic
+        self.beta12: float = 0.0  # adx
+        self.beta13: float = 0.0  # bollinger_prox
 
         self.is_trained: bool = False
         self.prediction_horizon: int = 15
@@ -118,13 +122,13 @@ class LinearRegressionModel:
         # ── Build feature matrix X and target y ───────────────────────
         rows, ys = [], []
         for i in range(prediction_horizon, n + prediction_horizon):
-            x1, x2, x3, x4, x5, x6, x7, x8, x9 = get_features(
+            feats = get_features(
                 symbol, timeframe, i, feature_window, rsi_period
             )
             current_price = closes[i]
             future_price  = closes[i - prediction_horizon]
             y = (future_price - current_price) / point
-            rows.append([x1, x2, x3, x4, x5, x6, x7, x8, x9])
+            rows.append(feats)
             ys.append(y)
 
         X = np.array(rows, dtype=np.float64)
@@ -190,6 +194,10 @@ class LinearRegressionModel:
         self.beta7 = float(fi[6]) if len(fi) > 6 else 0.0
         self.beta8 = float(fi[7]) if len(fi) > 7 else 0.0
         self.beta9 = float(fi[8]) if len(fi) > 8 else 0.0
+        self.beta10 = float(fi[9]) if len(fi) > 9 else 0.0
+        self.beta11 = float(fi[10]) if len(fi) > 10 else 0.0
+        self.beta12 = float(fi[11]) if len(fi) > 11 else 0.0
+        self.beta13 = float(fi[12]) if len(fi) > 12 else 0.0
 
     def _train_ols(self, X, y) -> None:
         """Fallback: joint OLS via numpy lstsq with manual standardisation."""

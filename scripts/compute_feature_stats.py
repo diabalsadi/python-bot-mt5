@@ -45,7 +45,8 @@ def compute_feature_stats(symbol: str, timeframe: int, n_bars: int = 5000):
     feature_names = [
         "momentum", "volatility", "trend", "rsi",
         "sr_distance", "liquidity", "volume_delta",
-        "spread_norm", "bar_range_ratio"
+        "spread_norm", "bar_range_ratio",
+        "macd", "stochastic", "adx", "bollinger_prox"
     ]
     
     # Collect all feature values
@@ -92,7 +93,7 @@ def update_config(stats: dict):
 Feature normalization statistics (auto-generated).
 
 Computed from historical data.
-DO NOT edit manually — use scripts/compute_feature_stats.py to update.
+DO NOT edit manually - use scripts/compute_feature_stats.py to update.
 """
 
 FEATURE_STATS = {
@@ -115,7 +116,7 @@ def get_feature_stats(feature_name: str) -> dict:
     return FEATURE_STATS[feature_name]
 '''
     
-    with open("config/feature_stats.py", "w") as f:
+    with open("config/feature_stats.py", "w", encoding="utf-8") as f:
         f.write(config_content)
     
     print(f"\n✅ Updated config/feature_stats.py")

@@ -46,6 +46,10 @@ FEATURE_NAMES = [
     "volume_delta",
     "spread_norm",
     "bar_range_ratio",
+    "macd",
+    "stochastic",
+    "adx",
+    "bollinger_prox",
 ]
 
 # Which features are directional (positive = bullish signal)
@@ -59,6 +63,10 @@ _BULLISH_POSITIVE = {
     "volume_delta":   True,    # positive delta = more buy volume
     "spread_norm":    False,   # non-directional
     "bar_range_ratio":False,   # non-directional
+    "macd":           True,    # positive MACD = bullish
+    "stochastic":     True,    # positive Stoch = bullish
+    "adx":            False,   # trend strength, not direction
+    "bollinger_prox": False,   # >0 could be overbought, non-directional direct
 }
 
 
@@ -123,8 +131,8 @@ class SHAPExplainer:
 
         try:
             X = np.array(X_row, dtype=np.float64).reshape(1, -1)
-            sv = self._explainer.shap_values(X)  # shape (1, 9) or (9,)
-            sv = np.array(sv).flatten()[:9]       # always (9,)
+            sv = self._explainer.shap_values(X)  # shape (1, 13) or (13,)
+            sv = np.array(sv).flatten()[:13]       # always (13,)
 
             # Top feature by absolute SHAP value
             top_idx  = int(np.argmax(np.abs(sv)))
@@ -203,7 +211,7 @@ class _SHAPResult:
     @classmethod
     def null(cls) -> "_SHAPResult":
         return cls(
-            shap_values=np.zeros(6),
+            shap_values=np.zeros(13),
             top_feature="unknown",
             top_shap_value=0.0,
             top_raw_value=0.0,

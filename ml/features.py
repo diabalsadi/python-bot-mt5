@@ -1,6 +1,14 @@
 """
 Feature extraction and normalization for ML model.
 
+Includes 15 features:
+  1-9:   Core (momentum, volatility, trend, rsi, sr_distance, liquidity,
+         volume_delta, spread_norm, bar_range_ratio)
+  10-13: Advanced (macd, stochastic, adx, bollinger_prox)
+  14:    SMC composite score (Order Blocks + FVG + BOS/CHoCH)
+  15:    UT Bot signal (ATR trailing stop crossover)
+
+
 CRITICAL: All features are normalized before returning to prevent
 the "exploding features" problem (rsi=1767, spread_norm=-2105, etc.).
 
@@ -26,6 +34,8 @@ from indicators.macd import calculate_macd
 from indicators.stochastic import calculate_stochastic
 from indicators.adx import calculate_adx
 from indicators.bollinger_bands import calculate_bollinger_proximity
+from indicators.smc import calculate_smc_score
+from indicators.ut_bot import calculate_ut_bot_signal
 from utils.normalization import robust_normalize
 from config.feature_stats import FEATURE_STATS
 
@@ -38,9 +48,9 @@ def get_features(
     rsi_period,
 ):
     """
-    Extract and normalize all 13 features for ML model.
+    Extract and normalize all 15 features for ML model.
     
-    Returns tuple of 13 normalized features.
+    Returns tuple of 15 normalized features.
     All values are in range [-5, 5] after robust normalization.
     """
     
@@ -59,6 +69,8 @@ def get_features(
     stoch_raw = calculate_stochastic(symbol, timeframe, shift)
     adx_raw = calculate_adx(symbol, timeframe, shift)
     bb_prox_raw = calculate_bollinger_proximity(symbol, timeframe, shift)
+    smc_raw = calculate_smc_score(symbol, timeframe, shift)
+    ut_bot_raw = calculate_ut_bot_signal(symbol, timeframe, shift)
 
     # Normalize using historical mean/std from config
     stats = FEATURE_STATS
@@ -82,6 +94,8 @@ def get_features(
     stochastic = norm(stoch_raw, "stochastic")
     adx = norm(adx_raw, "adx")
     bollinger_prox = norm(bb_prox_raw, "bollinger_prox")
+    smc = norm(smc_raw, "smc")
+    ut_bot = norm(ut_bot_raw, "ut_bot")
 
     return (
         momentum,
@@ -97,4 +111,6 @@ def get_features(
         stochastic,
         adx,
         bollinger_prox,
+        smc,
+        ut_bot,
     )

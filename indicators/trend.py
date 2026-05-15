@@ -77,12 +77,16 @@ def get_technical_trend(
     3. Stochastic (13, 8, 8)
     4. MACD (12, 26, 9)
     5. RSI Pullback Filter
+    6. Smart Money Concepts (Order Blocks, FVG, BOS/CHoCH)
+    7. UT Bot Alerts (ATR trailing-stop crossover)
     """
     from indicators.rsi import calculate_rsi
     from indicators.ema import calculate_ema
     from indicators.ichimoku import calculate_ichimoku
     from indicators.stochastic import calculate_stochastic
     from indicators.macd import calculate_macd
+    from indicators.smc import detect_structure_breaks, calculate_ob_proximity
+    from indicators.ut_bot import calculate_ut_bot
 
     # 1. PRICE DATA
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, 1)
@@ -112,19 +116,49 @@ def get_technical_trend(
     stoch_k, stoch_d = calculate_stochastic(symbol, timeframe, 0, 13, 8, 8)
     macd_main, macd_sig = calculate_macd(symbol, timeframe, 0, return_tuple=True)
 
+    # 5. SMART MONEY CONCEPTS (institutional bias)
+    smc_struct = detect_structure_breaks(symbol, timeframe, 0)
+    ob_prox = calculate_ob_proximity(symbol, timeframe, 0)
+
+    # 6. UT BOT (ATR trailing-stop direction)
+    ut = calculate_ut_bot(symbol, timeframe, 0)
+
     # ── CONFLUENCE LOGIC ───────────────────────────────────────────
-    
+
+    # OB proximity bonus: when price is on an Order Block the RSI
+    # window widens because institutional levels give extra edge.
+    on_bullish_ob = ob_prox > 0.3    # near a bullish Order Block
+    on_bearish_ob = ob_prox < -0.3   # near a bearish Order Block
+
     # BULLISH SIGNAL (BUY)
-    # Stricter: Price above all EMAs, above Cloud, and Momentum turning up
+    # Price above all EMAs, above Cloud, Momentum turning up,
+    # SMC / UT Bot not strongly opposed, OB can widen RSI window.
     if bullish_stack and above_cloud:
-        # Check for pullback completion (RSI rising from low, Stoch cross)
-        if (30.0 < rsi < 55.0) and (stoch_k > stoch_d) and (macd_main > macd_sig):
-            # Exhaustion filter
-            if rsi < 80.0: return 1
-            
+        rsi_upper = 65.0 if on_bullish_ob else 55.0  # wider window at OB
+        if (30.0 < rsi < rsi_upper) and (stoch_k > stoch_d) and (macd_main > macd_sig):
+            if rsi < 80.0:
+                if not smc_struct["choch_bearish"]:
+                    if not ut["sell_signal"]:
+                        return 1
+
     # BEARISH SIGNAL (SELL)
     if bearish_stack and below_cloud:
-        if (45.0 < rsi < 70.0) and (stoch_k < stoch_d) and (macd_main < macd_sig):
-            if rsi > 20.0: return -1
+        rsi_lower = 35.0 if on_bearish_ob else 45.0  # wider window at OB
+        if (rsi_lower < rsi < 70.0) and (stoch_k < stoch_d) and (macd_main < macd_sig):
+            if rsi > 20.0:
+                if not smc_struct["choch_bullish"]:
+                    if not ut["buy_signal"]:
+                        return -1
+
+    # ── SMC + UT Bot Override: Strong reversal signal ─────────────
+    # CHoCH + UT Bot crossover + price at an Order Block = high-prob reversal.
+    # OB proximity required so reversals only fire at institutional levels.
+    if smc_struct["choch_bullish"] and ut["buy_signal"] and on_bullish_ob:
+        if above_cloud and (30.0 < rsi < 65.0):
+            return 1
+
+    if smc_struct["choch_bearish"] and ut["sell_signal"] and on_bearish_ob:
+        if below_cloud and (35.0 < rsi < 70.0):
+            return -1
 
     return 0

@@ -50,7 +50,11 @@ FEATURE_NAMES = [
     "stochastic",
     "adx",
     "bollinger_prox",
+    "smc",
+    "ut_bot",
 ]
+
+_N_FEATURES = len(FEATURE_NAMES)
 
 # Which features are directional (positive = bullish signal)
 _BULLISH_POSITIVE = {
@@ -67,6 +71,8 @@ _BULLISH_POSITIVE = {
     "stochastic":     True,    # positive Stoch = bullish
     "adx":            False,   # trend strength, not direction
     "bollinger_prox": False,   # >0 could be overbought, non-directional direct
+    "smc":            True,    # positive = bullish institutional bias
+    "ut_bot":         True,    # positive = bullish ATR trailing crossover
 }
 
 
@@ -131,8 +137,8 @@ class SHAPExplainer:
 
         try:
             X = np.array(X_row, dtype=np.float64).reshape(1, -1)
-            sv = self._explainer.shap_values(X)  # shape (1, 13) or (13,)
-            sv = np.array(sv).flatten()[:13]       # always (13,)
+            sv = self._explainer.shap_values(X)  # shape (1, N) or (N,)
+            sv = np.array(sv).flatten()[:_N_FEATURES]  # always (N_FEATURES,)
 
             # Top feature by absolute SHAP value
             top_idx  = int(np.argmax(np.abs(sv)))
@@ -211,7 +217,7 @@ class _SHAPResult:
     @classmethod
     def null(cls) -> "_SHAPResult":
         return cls(
-            shap_values=np.zeros(13),
+            shap_values=np.zeros(_N_FEATURES),
             top_feature="unknown",
             top_shap_value=0.0,
             top_raw_value=0.0,

@@ -1,4 +1,4 @@
-﻿
+
 FEATURE_STATS = {
     "momentum": {"mean": 0.0, "std": 100.0},
     "volatility": {"mean": 2.0, "std": 3.0},
@@ -13,6 +13,8 @@ FEATURE_STATS = {
     "stochastic": {"mean": 0.0, "std": 0.5},
     "adx": {"mean": 0.0, "std": 0.5},
     "bollinger_prox": {"mean": 0.0, "std": 0.5},
+    "smc": {"mean": 0.0, "std": 0.5},
+    "ut_bot": {"mean": 0.0, "std": 0.5},
 }
 def get_feature_stats(feature_name: str) -> dict:
     if feature_name not in FEATURE_STATS:

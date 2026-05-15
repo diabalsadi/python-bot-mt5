@@ -645,6 +645,8 @@ def on_tick() -> None:
         stochastic,
         adx,
         bollinger_prox,
+        smc,
+        ut_bot,
     ) = features
 
     # ── Check for new closed candle ────────────────────────────────
@@ -680,9 +682,21 @@ def on_tick() -> None:
         else:
             bearish += 1
 
-        if bullish >= 3:
+        # SMC: institutional bias
+        if smc > 0.3:
+            bullish += 1
+        elif smc < -0.3:
+            bearish += 1
+
+        # UT Bot: ATR trailing stop direction
+        if ut_bot > 0:
+            bullish += 1
+        elif ut_bot < 0:
+            bearish += 1
+
+        if bullish >= 4:
             signal = "BUY"
-        elif bearish >= 3:
+        elif bearish >= 4:
             signal = "SELL"
         else:
             signal = "NONE"

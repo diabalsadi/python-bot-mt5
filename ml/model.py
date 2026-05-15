@@ -64,6 +64,8 @@ class LinearRegressionModel:
         self.beta11: float = 0.0  # stochastic
         self.beta12: float = 0.0  # adx
         self.beta13: float = 0.0  # bollinger_prox
+        self.beta14: float = 0.0  # smc
+        self.beta15: float = 0.0  # ut_bot
 
         self.is_trained: bool = False
         self.prediction_horizon: int = 15
@@ -198,6 +200,8 @@ class LinearRegressionModel:
         self.beta11 = float(fi[10]) if len(fi) > 10 else 0.0
         self.beta12 = float(fi[11]) if len(fi) > 11 else 0.0
         self.beta13 = float(fi[12]) if len(fi) > 12 else 0.0
+        self.beta14 = float(fi[13]) if len(fi) > 13 else 0.0
+        self.beta15 = float(fi[14]) if len(fi) > 14 else 0.0
 
     def _train_ols(self, X, y) -> None:
         """Fallback: joint OLS via numpy lstsq with manual standardisation."""

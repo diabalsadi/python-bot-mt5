@@ -20,6 +20,11 @@ from typing import Optional, List, Tuple
 
 import numpy as np
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 
 # ── Lazy MT5 import (so backtest can be imported in tests without MT5) ────────
 def _get_mt5():
@@ -113,7 +118,7 @@ class Backtester:
       - mid_dominates_opposite filter (mirrors the v8 confluence fix)
       - anti-hedge (one direction at a time)
       - SL/TP applied on future bars
-      - 10% risk sizing per trade
+      - configurable risk sizing per trade
     """
 
     def __init__(
@@ -126,17 +131,19 @@ class Backtester:
         commission_percent: float = 0.0005,
         sl_points:          int   = 150,
         tp_ratio:           float = 2.0,         # TP = sl_points * tp_ratio
-        risk_percent:       float = 10.0,
+        risk_percent:       float = 5.0,
+        trade_cooldown_minutes: float = 5.0,
     ):
         self.symbol             = symbol
         self.timeframe          = timeframe
-        self.start_date         = datetime.strptime(start_date, "%Y-%m-%d")
-        self.end_date           = datetime.strptime(end_date,   "%Y-%m-%d")
+        self.start_date         = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        self.end_date           = datetime.strptime(end_date,   "%Y-%m-%d").replace(tzinfo=timezone.utc)
         self.initial_balance    = initial_balance
         self.commission_percent = commission_percent
         self.sl_points          = sl_points
         self.tp_ratio           = tp_ratio
         self.risk_percent       = risk_percent
+        self.trade_cooldown_minutes = trade_cooldown_minutes
 
         self.trades:       List[Trade]                 = []
         self.results       = BacktestResults()
@@ -147,12 +154,14 @@ class Backtester:
         self._min_lookback:  int         = 25
         self._sim_direction: Optional[str] = None
         self._open_trade:    Optional[Trade] = None
+        self._cooldown_until: Optional[datetime] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def run(self) -> BacktestResults:
         print(f"\n🔄 Backtesting {self.symbol}  {self.start_date.date()} → {self.end_date.date()}")
         print(f"   Risk: {self.risk_percent}%/trade  SL: {self.sl_points}pt  TP: {self.sl_points * self.tp_ratio:.0f}pt")
+        print(f"   Hard cooldown: {self.trade_cooldown_minutes:.1f} min after each close")
 
         bars = self._fetch_historical_data()
         if bars is None or len(bars) == 0:
@@ -165,10 +174,11 @@ class Backtester:
             self._history.append(bar)
 
             # Check SL/TP on open trade first
+            closed_this_bar = False
             if self._open_trade and not self._open_trade.is_closed():
-                self._check_sl_tp(bar)
+                closed_this_bar = self._check_sl_tp(bar)
 
-            signal = self._generate_signal(i)
+            signal = None if closed_this_bar or self._in_cooldown(bar) else self._generate_signal(i)
             if signal:
                 self._process_signal(signal, bar)
 
@@ -181,6 +191,63 @@ class Backtester:
             ts   = self._bar_time(last)
             self._open_trade.close_trade(ts, float(last["close"]))
             self.current_balance += self._open_trade.profit_loss
+            self._start_cooldown(ts)
+
+        self._calculate_results()
+        return self.results
+
+    def run_walk_forward(self, train_ratio: float = 0.70) -> BacktestResults:
+        """
+        Walk-forward validation.
+
+        The first slice is used only to warm indicators/calibration state. Trades
+        are opened only on the later unseen slice, which gives a cleaner
+        overfitting check than reporting performance on the whole history.
+        """
+        print(f"\nWalk-forward backtest {self.symbol} {self.start_date.date()} -> {self.end_date.date()}")
+        bars = self._fetch_historical_data()
+        if bars is None or len(bars) == 0:
+            print("No historical data; is MT5 connected and the symbol correct?")
+            return self.results
+
+        split = int(len(bars) * max(0.1, min(0.9, train_ratio)))
+        train_bars = bars[:split]
+        test_bars = bars[split:]
+        if len(test_bars) < self._min_lookback:
+            print("Walk-forward test slice is too small.")
+            return self.results
+
+        print(
+            f"Loaded {len(bars):,} bars | warm/train={len(train_bars):,} "
+            f"unseen/test={len(test_bars):,}"
+        )
+        print(f"Hard cooldown: {self.trade_cooldown_minutes:.1f} min after each close")
+
+        for bar in train_bars:
+            self._history.append(bar)
+
+        for i, bar in enumerate(test_bars, start=split):
+            self._history.append(bar)
+            closed_this_bar = False
+            if self._open_trade and not self._open_trade.is_closed():
+                closed_this_bar = self._check_sl_tp(bar)
+
+            signal = None if closed_this_bar or self._in_cooldown(bar) else self._generate_signal(i)
+            if signal:
+                self._process_signal(signal, bar)
+
+            if (i - split) % 10000 == 0 and i > split:
+                print(
+                    f"  ... {i - split:,}/{len(test_bars):,} unseen bars "
+                    f"trades={len(self.trades)} balance=${self.current_balance:,.2f}"
+                )
+
+        if self._open_trade and not self._open_trade.is_closed():
+            last = test_bars[-1]
+            close_time = self._bar_time(last)
+            self._open_trade.close_trade(close_time, float(last["close"]))
+            self.current_balance += self._open_trade.profit_loss
+            self._start_cooldown(close_time)
 
         self._calculate_results()
         return self.results
@@ -193,19 +260,173 @@ class Backtester:
             print("❌ MetaTrader5 package not available")
             return None
 
-        if not mt5.initialize():
+        if load_dotenv is not None:
+            load_dotenv()
+
+        login_raw = os.getenv("LOGIN")
+        kwargs = {}
+        if os.getenv("MT5_PATH"):
+            kwargs["path"] = os.getenv("MT5_PATH")
+        if login_raw:
+            kwargs["login"] = int(login_raw)
+        if os.getenv("SERVER"):
+            kwargs["server"] = os.getenv("SERVER")
+        if os.getenv("PASSWORD"):
+            kwargs["password"] = os.getenv("PASSWORD")
+
+        if not mt5.initialize(**kwargs):
             print(f"❌ MT5 init failed: {mt5.last_error()}")
             print("   Make sure MT5 terminal is running and logged in.")
             return None
 
-        rates = mt5.copy_rates_range(self.symbol, self.timeframe, self.start_date, self.end_date)
-        mt5.shutdown()
+        account = mt5.account_info()
+        if account is not None:
+            print(f"Connected MT5 account={account.login} server={account.server}")
+
+        if not mt5.symbol_select(self.symbol, True):
+            print(f"Could not select symbol {self.symbol}.")
+            self._print_symbol_suggestions(mt5)
+            mt5.shutdown()
+            return None
+
+        rates = self._copy_rates_with_fallback(mt5)
 
         if rates is None or len(rates) == 0:
             print(f"❌ No data for {self.symbol}. Check symbol name (try 'XAUUSDm' or 'XAUUSD').")
+            self._print_symbol_suggestions(mt5)
+            mt5.shutdown()
             return None
 
+        mt5.shutdown()
         return rates
+
+    def _copy_rates_with_fallback(self, mt5):
+        """Fetch bars by date range, then fall back to latest-position history."""
+        rates = mt5.copy_rates_range(self.symbol, self.timeframe, self.start_date, self.end_date)
+        if rates is not None and len(rates) > 0:
+            print(f"Fetched {len(rates):,} bars by date range.")
+            return rates
+
+        err = mt5.last_error()
+        print(f"Date-range fetch returned no bars for {self.symbol}; MT5 last_error={err}.")
+
+        chunked = self._copy_rates_range_chunked(mt5)
+        if chunked is not None and len(chunked) > 0:
+            print(f"Fetched {len(chunked):,} bars by chunked date range.")
+            return chunked
+
+        tf_seconds = self._timeframe_seconds()
+        requested_seconds = max(1.0, (self.end_date - self.start_date).total_seconds())
+        requested_bars = int(requested_seconds / tf_seconds) + self._min_lookback + 500
+        request_count = max(2000, min(250000, requested_bars))
+
+        rates = self._copy_rates_from_pos_chunked(mt5, request_count)
+        if rates is None or len(rates) == 0:
+            return rates
+
+        start_ts = int(self.start_date.timestamp())
+        end_ts = int(self.end_date.timestamp())
+        filtered = rates[(rates["time"] >= start_ts) & (rates["time"] <= end_ts)]
+
+        if len(filtered) > 0:
+            print(
+                f"Fallback fetched {len(rates):,} latest bars; "
+                f"{len(filtered):,} are inside requested dates."
+            )
+            return filtered
+
+        first = datetime.fromtimestamp(int(rates[0]["time"]), tz=timezone.utc).date()
+        last = datetime.fromtimestamp(int(rates[-1]["time"]), tz=timezone.utc).date()
+        print(
+            f"Fallback fetched {len(rates):,} latest bars, but they cover {first} -> {last}, "
+            f"not {self.start_date.date()} -> {self.end_date.date()}."
+        )
+        print("Using the latest available bars instead so you can still validate behavior.")
+        return rates
+
+    def _copy_rates_range_chunked(self, mt5):
+        """Fetch date ranges in MT5-friendly chunks."""
+        chunks = []
+        cursor = self.start_date
+        max_span = timedelta(days=29)
+        while cursor < self.end_date:
+            chunk_end = min(cursor + max_span, self.end_date)
+            part = mt5.copy_rates_range(self.symbol, self.timeframe, cursor, chunk_end)
+            if part is not None and len(part) > 0:
+                chunks.append(part)
+            cursor = chunk_end + timedelta(seconds=self._timeframe_seconds())
+
+        return self._merge_rate_chunks(chunks)
+
+    def _copy_rates_from_pos_chunked(self, mt5, total_count: int):
+        """Fetch latest bars in chunks because large MT5 requests can fail."""
+        chunks = []
+        chunk_size = 50000
+        start_pos = 0
+        while start_pos < total_count:
+            count = min(chunk_size, total_count - start_pos)
+            part = mt5.copy_rates_from_pos(self.symbol, self.timeframe, start_pos, count)
+            if part is None or len(part) == 0:
+                print(
+                    f"Latest-bars chunk stopped at start_pos={start_pos}, "
+                    f"count={count}; MT5 last_error={mt5.last_error()}."
+                )
+                break
+            chunks.append(part)
+            if len(part) < count:
+                break
+            start_pos += count
+
+        return self._merge_rate_chunks(chunks)
+
+    @staticmethod
+    def _merge_rate_chunks(chunks):
+        if not chunks:
+            return None
+        merged = np.concatenate(chunks)
+        _, idx = np.unique(merged["time"], return_index=True)
+        merged = merged[np.sort(idx)]
+        return np.sort(merged, order="time")
+
+    def _timeframe_seconds(self) -> int:
+        mapping = {
+            1: 60,
+            2: 120,
+            3: 180,
+            4: 240,
+            5: 300,
+            6: 360,
+            10: 600,
+            12: 720,
+            15: 900,
+            20: 1200,
+            30: 1800,
+            16385: 3600,
+            16386: 7200,
+            16387: 10800,
+            16388: 14400,
+            16390: 21600,
+            16392: 28800,
+            16396: 43200,
+            16408: 86400,
+        }
+        return mapping.get(self.timeframe, 60)
+
+    def _print_symbol_suggestions(self, mt5) -> None:
+        """Print broker symbols that look like gold/XAU for quick correction."""
+        try:
+            symbols = mt5.symbols_get()
+        except Exception:
+            symbols = None
+        if not symbols:
+            return
+        matches = [
+            s.name for s in symbols
+            if "XAU" in s.name.upper() or "GOLD" in s.name.upper()
+        ][:20]
+        if matches:
+            print("Gold-like symbols available from this terminal:")
+            print("  " + ", ".join(matches))
 
     # ── Signal generation ─────────────────────────────────────────────────────
 
@@ -296,6 +517,8 @@ class Backtester:
             pnl = self._open_trade.profit_loss * (1 - self.commission_percent)
             self.current_balance += pnl
             self.equity_curve.append((entry_time, self.current_balance))
+            self._start_cooldown(entry_time)
+            return
 
         risk_amount = self.current_balance * (self.risk_percent / 100)
         lot = max(0.01, round(risk_amount / (self.sl_points * 1.0), 2))
@@ -323,16 +546,16 @@ class Backtester:
         self._sim_direction = signal
         self.equity_curve.append((entry_time, self.current_balance))
 
-    def _check_sl_tp(self, bar) -> None:
+    def _check_sl_tp(self, bar) -> bool:
         """Check if SL or TP was hit on the current bar."""
         t = self._open_trade
         if t is None or t.is_closed():
-            return
+            return False
 
         sl = getattr(t, "_sl", None)
         tp = getattr(t, "_tp", None)
         if sl is None or tp is None:
-            return
+            return False
 
         high  = float(bar["high"])
         low   = float(bar["low"])
@@ -345,12 +568,16 @@ class Backtester:
                 self.current_balance += pnl
                 self.equity_curve.append((btime, self.current_balance))
                 self._sim_direction = None
+                self._start_cooldown(btime)
+                return True
             elif high >= tp:
                 t.close_trade(btime, tp)
                 pnl = t.profit_loss * (1 - self.commission_percent)
                 self.current_balance += pnl
                 self.equity_curve.append((btime, self.current_balance))
                 self._sim_direction = None
+                self._start_cooldown(btime)
+                return True
         else:
             if high >= sl:
                 t.close_trade(btime, sl)
@@ -358,12 +585,29 @@ class Backtester:
                 self.current_balance += pnl
                 self.equity_curve.append((btime, self.current_balance))
                 self._sim_direction = None
+                self._start_cooldown(btime)
+                return True
             elif low <= tp:
                 t.close_trade(btime, tp)
                 pnl = t.profit_loss * (1 - self.commission_percent)
                 self.current_balance += pnl
                 self.equity_curve.append((btime, self.current_balance))
                 self._sim_direction = None
+                self._start_cooldown(btime)
+                return True
+
+        return False
+
+    def _start_cooldown(self, close_time: datetime) -> None:
+        if self.trade_cooldown_minutes <= 0:
+            self._cooldown_until = None
+            return
+        self._cooldown_until = close_time + timedelta(minutes=self.trade_cooldown_minutes)
+
+    def _in_cooldown(self, bar) -> bool:
+        if self._cooldown_until is None:
+            return False
+        return self._bar_time(bar) < self._cooldown_until
 
     # ── Metrics ───────────────────────────────────────────────────────────────
 
@@ -440,7 +684,7 @@ class Backtester:
                                 t.direction, t.volume,
                                 f"{t.profit_loss:.2f}", f"{t.profit_pct:.4f}",
                                 f"{t.duration_minutes:.1f}"])
-        print(f"✅ Results saved → {filename}")
+        print(f"Results saved -> {filename}")
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -450,8 +694,11 @@ if __name__ == "__main__":
     parser.add_argument("--symbol",   default="XAUUSDm",    help="Symbol (default: XAUUSDm)")
     parser.add_argument("--days",     type=int, default=30,  help="How many days back (default: 30)")
     parser.add_argument("--balance",  type=float, default=10000, help="Starting balance (default: 10000)")
-    parser.add_argument("--risk",     type=float, default=10.0,  help="Risk %% per trade (default: 10)")
+    parser.add_argument("--risk",     type=float, default=5.0,   help="Risk %% per trade (default: 5)")
     parser.add_argument("--sl",       type=int,   default=150,   help="SL in points (default: 150)")
+    parser.add_argument("--walk-forward", action="store_true", help="Trade only the unseen future split")
+    parser.add_argument("--train-ratio", type=float, default=0.70, help="Warm/train split for walk-forward")
+    parser.add_argument("--cooldown-minutes", type=float, default=5.0, help="Hard cooldown after each close")
     args = parser.parse_args()
 
     end   = datetime.now()
@@ -465,8 +712,9 @@ if __name__ == "__main__":
         initial_balance=args.balance,
         risk_percent=args.risk,
         sl_points=args.sl,
+        trade_cooldown_minutes=args.cooldown_minutes,
     )
 
-    results = bt.run()
+    results = bt.run_walk_forward(args.train_ratio) if args.walk_forward else bt.run()
     results.print_summary()
     bt.save_results()

@@ -205,7 +205,33 @@ def get_ml_sltp(
         atr_pts = float(max(min_pts, sl_points_default))
 
     # Base SL = 1.5 × ATR — gives breathing room without excessive risk
-    sl_pts = atr_pts * 1.5
+    prediction = model.predict(symbol, timeframe, feature_window, rsi_period) if model else 0.0
+    direction = "BUY" if prediction > 0 else "SELL" if prediction < 0 else "UNKNOWN"
+    regime_name = "UNKNOWN"
+    regime_conf = 0.0
+    sl_mult = 1.5
+    tp_mult = 2.0
+    try:
+        from indicators.regime import Regime, detect_regime
+
+        regime, regime_conf = detect_regime(symbol, timeframe)
+        regime_name = regime.value
+        if regime == Regime.RANGING and regime_conf > 0.45:
+            sl_mult, tp_mult = 1.0, 1.35
+        elif regime == Regime.TRENDING_UP and regime_conf > 0.55:
+            sl_mult, tp_mult = (1.7, 2.7) if direction == "BUY" else (0.9, 1.2)
+        elif regime == Regime.TRENDING_DOWN and regime_conf > 0.55:
+            sl_mult, tp_mult = (1.7, 2.7) if direction == "SELL" else (0.9, 1.2)
+    except Exception as exc:
+        logging.debug(f"Regime SL/TP fallback: {exc}")
+
+    signal_strength = abs(prediction) / max(atr_pts * point, point)
+    if signal_strength > 1.8:
+        tp_mult += 0.4
+    elif signal_strength < 0.7:
+        tp_mult = max(1.15, tp_mult - 0.35)
+
+    sl_pts = atr_pts * sl_mult
 
     # Widen SL to clear the nearest liquidity zone below/above entry
     # so we don't get swept before the trade has a chance
@@ -226,7 +252,7 @@ def get_ml_sltp(
     sl_pts = max(float(min_pts), min(sl_pts, float(sl_points_default) * 3.0))
 
     # TP = 2 × SL — fixed 1:2 RR
-    tp_pts = sl_pts * 2.0
+    tp_pts = sl_pts * tp_mult
     tp_pts = max(float(min_pts), tp_pts)
 
     sl_dist = round(sl_pts * point, digits)
@@ -234,7 +260,7 @@ def get_ml_sltp(
 
     print(
         f"📊 ATR SL/TP | ATR={atr_pts:.0f}pt  "
-        f"SL={sl_pts:.0f}pt  TP={tp_pts:.0f}pt  RR=1:2.0"
+        f"SL={sl_pts:.0f}pt  TP={tp_pts:.0f}pt  RR=1:{tp_mult:.2f}"
     )
     return sl_dist, tp_dist
 
@@ -793,7 +819,7 @@ def execute_buy_market(
 
     # Portfolio-level guard
     from position_manager import get_position_manager
-    ok, reason = get_position_manager().can_open_position(symbol)
+    ok, reason = get_position_manager().can_open_position(symbol, direction="BUY")
     if not ok:
         print(f"🚫 PositionManager: BUY blocked — {reason}")
         return
@@ -815,8 +841,8 @@ def execute_buy_market(
     
     confidence_mult = 1.0
     if prediction > atr * 1.5:
-        confidence_mult = 5.0
-        print(f"🔥 HIGH CONFIDENCE BUY: pred ({prediction:.3f}) > 1.5x ATR ({atr:.3f}) → 5x Risk!")
+        confidence_mult = 1.5
+        print(f"🔥 HIGH CONFIDENCE BUY: pred ({prediction:.3f}) > 1.5x ATR ({atr:.3f}) → 1.5x Risk")
         
     lot = calculate_lot_size(symbol, sl_pts, risk_percent * confidence_mult)
 
@@ -892,7 +918,7 @@ def execute_sell_market(
 
     # Portfolio-level guard
     from position_manager import get_position_manager
-    ok, reason = get_position_manager().can_open_position(symbol)
+    ok, reason = get_position_manager().can_open_position(symbol, direction="SELL")
     if not ok:
         print(f"🚫 PositionManager: SELL blocked — {reason}")
         return
@@ -915,8 +941,8 @@ def execute_sell_market(
     
     confidence_mult = 1.0
     if prediction < -atr * 1.5:
-        confidence_mult = 5.0
-        print(f"🔥 HIGH CONFIDENCE SELL: pred ({prediction:.3f}) < -1.5x ATR ({-atr:.3f}) → 5x Risk!")
+        confidence_mult = 1.5
+        print(f"🔥 HIGH CONFIDENCE SELL: pred ({prediction:.3f}) < -1.5x ATR ({-atr:.3f}) → 1.5x Risk")
         
     lot = calculate_lot_size(symbol, sl_pts, risk_percent * confidence_mult)
 

@@ -35,6 +35,8 @@ class PositionManager:
         self,
         max_positions: int = 3,
         max_position_size_percent: float = 2.0,
+        max_same_direction: int = 2,
+        max_directional_exposure_ratio: float = 0.67,
         check_interval_seconds: float = 1.0,
     ):
         """
@@ -47,6 +49,8 @@ class PositionManager:
         """
         self.max_positions = max_positions
         self.max_position_size_percent = max_position_size_percent
+        self.max_same_direction = max_same_direction
+        self.max_directional_exposure_ratio = max_directional_exposure_ratio
         self.check_interval_seconds = check_interval_seconds
 
         # State tracking
@@ -76,15 +80,12 @@ class PositionManager:
         print(f"✅ Session started | Balance: ${account.balance:,.2f}")
         return True
     
-    def can_open_position(self, symbol: Optional[str] = None) -> tuple[bool, str]:
+    def can_open_position(self, symbol: Optional[str] = None, direction: Optional[str] = None) -> tuple[bool, str]:
         """
         Check if a new position can be opened.
         Only enforces max concurrent positions — no balance % limits.
         """
         now = time.time()
-
-        if now - self._last_check_ts < self.check_interval_seconds:
-            return (not self._trading_disabled, self._disable_reason)
 
         self._last_check_ts = now
 
@@ -98,6 +99,33 @@ class PositionManager:
         if len(positions) >= self.max_positions:
             msg = f"Max positions ({self.max_positions}) reached"
             return (False, msg)
+
+        if direction:
+            direction = direction.upper()
+            side_type = (
+                mt5.POSITION_TYPE_BUY if direction == "BUY"
+                else mt5.POSITION_TYPE_SELL if direction == "SELL"
+                else None
+            )
+            scoped = [
+                p for p in positions
+                if symbol is None or getattr(p, "symbol", None) == symbol
+            ]
+            same_side = [
+                p for p in scoped
+                if side_type is not None and getattr(p, "type", None) == side_type
+            ]
+            if len(same_side) >= self.max_same_direction:
+                return (
+                    False,
+                    f"Max same-direction {direction} positions ({self.max_same_direction}) reached",
+                )
+
+            projected_total = len(scoped) + 1
+            projected_same = len(same_side) + 1
+            if projected_total > 1 and projected_same / projected_total > self.max_directional_exposure_ratio:
+                ratio = self.max_directional_exposure_ratio * 100.0
+                return (False, f"{direction} exposure would exceed {ratio:.0f}% concentration")
 
         return (True, "")
     

@@ -127,7 +127,7 @@ class Backtester:
         timeframe:          int   = 1,           # TIMEFRAME_M1 = 1
         start_date:         str   = "2024-01-01",
         end_date:           str   = "2024-03-31",
-        initial_balance:    float = 10000.0,
+        initial_balance:    float = 50.0,
         commission_percent: float = 0.0005,
         sl_points:          int   = 150,
         tp_ratio:           float = 2.0,         # TP = sl_points * tp_ratio
@@ -182,7 +182,7 @@ class Backtester:
             if signal:
                 self._process_signal(signal, bar)
 
-            if i % 10000 == 0 and i > 0:
+            if i % 50 == 0 and i > 0:
                 print(f"  … {i:,}/{len(bars):,} bars  trades={len(self.trades)}  balance=${self.current_balance:,.2f}")
 
         # Close any open trade at last bar
@@ -236,7 +236,7 @@ class Backtester:
             if signal:
                 self._process_signal(signal, bar)
 
-            if (i - split) % 10000 == 0 and i > split:
+            if (i - split) % 50 == 0 and i > split:
                 print(
                     f"  ... {i - split:,}/{len(test_bars):,} unseen bars "
                     f"trades={len(self.trades)} balance=${self.current_balance:,.2f}"
@@ -693,7 +693,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtest the XAUUSDm strategy")
     parser.add_argument("--symbol",   default="XAUUSDm",    help="Symbol (default: XAUUSDm)")
     parser.add_argument("--days",     type=int, default=30,  help="How many days back (default: 30)")
-    parser.add_argument("--balance",  type=float, default=10000, help="Starting balance (default: 10000)")
+    parser.add_argument("--balance",  type=float, default=50, help="Starting balance (default: 50)")
     parser.add_argument("--risk",     type=float, default=5.0,   help="Risk %% per trade (default: 5)")
     parser.add_argument("--sl",       type=int,   default=150,   help="SL in points (default: 150)")
     parser.add_argument("--walk-forward", action="store_true", help="Trade only the unseen future split")

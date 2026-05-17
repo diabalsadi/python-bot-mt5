@@ -10,6 +10,13 @@ from __future__ import annotations
 
 import os
 from typing import Dict, List, Tuple
+import warnings
+
+# Suppress harmless scikit-learn feature name mismatch warnings
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names"
+)
 
 import MetaTrader5 as mt5
 import numpy as np

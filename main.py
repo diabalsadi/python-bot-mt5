@@ -37,6 +37,7 @@ import MetaTrader5 as mt5
 import numpy as np
 
 from risk.trade_filters import TradeFilter
+from risk.market_fusion import fuse_timeframes
 
 logging.basicConfig(
     filename="latency.log",
@@ -106,7 +107,7 @@ TREND_BARS = 15
 
 # Risk / order management
 SL_POINTS = 4000
-RISK_PERCENT = 10.0
+RISK_PERCENT = 5.0
 TRAILING_STEP_POINTS = 300
 EXPIRATION_HOURS = 50
 MIN_ORDER_DISTANCE_PTS = 500
@@ -168,6 +169,7 @@ _last_analysis_ts = 0.0
 # without a win, it pauses that direction for LOSS_PAUSE_SECONDS.
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_PAUSE_SECONDS     = 300   # 5 minutes
+HARD_TRADE_COOLDOWN_SECONDS = 300  # wait after every closed trade before new entries
 
 _consecutive_sell_losses = 0
 _consecutive_buy_losses  = 0
@@ -180,6 +182,8 @@ def _record_trade_outcome(direction: str, profit: float) -> None:
     """Call after a position closes to update the loss counter and train RL."""
     global _consecutive_sell_losses, _consecutive_buy_losses
     global _sell_paused_until, _buy_paused_until
+
+    trade_filter.start_cooldown(HARD_TRADE_COOLDOWN_SECONDS)
 
     # ── RL online update ──────────────────────────────────────────────
     if _last_rl_state is not None:
@@ -451,30 +455,22 @@ def on_tick() -> None:
     # M1 and M15 must agree AND M15 must not be overwhelmingly opposed.
     # If mid_prediction is >3× stronger than short in the opposite direction,
     # mid wins — this prevents entering BUY when mid screams SELL.
-    mid_dominates_opposite = (
-        prediction > 0 and mid_prediction < 0 and abs(mid_prediction) > abs(prediction) * 3
-    ) or (
-        prediction < 0 and mid_prediction > 0 and abs(mid_prediction) > abs(prediction) * 3
-    )
-
-    m1_m15_agree = (
-        (prediction > 0 and mid_prediction > 0) or
-        (prediction < 0 and mid_prediction < 0)
-    ) and not mid_dominates_opposite
-
-    # H1 soft filter: only blocks if strongly opposed (>50% of H1 volatility)
+    regime, regime_conf = _get_regime()
     vol_h1 = calculate_volatility(SYMBOL, LONG_TIMEFRAME, 1, ML_FEATURE_WINDOW)
-    h1_opposed = (prediction > 0 and long_prediction < -vol_h1 * 0.5) or \
-                 (prediction < 0 and long_prediction > vol_h1 * 0.5)
-
-    same_direction = m1_m15_agree and not h1_opposed
-    confirmed_prediction = prediction if same_direction else 0.0
+    fusion = fuse_timeframes(
+        prediction,
+        mid_prediction,
+        long_prediction,
+        vol_h1,
+        regime_confidence=regime_conf,
+    )
+    confirmed_prediction = fusion.confirmed_prediction
     predicted_price = tick.bid + prediction
 
     if show_analysis:
-        status_h1 = "OPPOSED (BLOCKED)" if h1_opposed else "OK"
         print(
-            f"ML Short: {prediction:+.5f} | Mid: {mid_prediction:+.5f} | Long: {long_prediction:+.5f} ({status_h1}) | "
+            f"ML Short: {prediction:+.5f} | Mid: {mid_prediction:+.5f} | Long: {long_prediction:+.5f} | "
+            f"Fusion: score={fusion.score:+.2f} conf={fusion.confidence:.2f} {fusion.reason} | "
             f"Confirmed: {confirmed_prediction:+.5f} | Target: {predicted_price:.5f}"
         )
         _last_analysis_ts = now_ts
@@ -570,6 +566,13 @@ def on_tick() -> None:
         model.shap.shap_rl_dims(np.array(_raw_feats), prediction)
         if (model.shap.is_fitted and _raw_feats is not None) else (0.0, 0.0)
     )
+    from indicators.order_flow import calculate_spread_norm, calculate_bar_range_ratio
+    spread_norm = calculate_spread_norm(SYMBOL, TIMEFRAME)
+    bar_range = calculate_bar_range_ratio(SYMBOL, TIMEFRAME)
+    current_positions = mt5.positions_get(symbol=SYMBOL) or []
+    buy_count = sum(1 for p in current_positions if p.type == mt5.POSITION_TYPE_BUY)
+    sell_count = sum(1 for p in current_positions if p.type == mt5.POSITION_TYPE_SELL)
+    position_bias = (buy_count - sell_count) / max(1, buy_count + sell_count)
 
     _last_rl_state = build_state(
         momentum=float(prediction),
@@ -581,6 +584,14 @@ def on_tick() -> None:
         recent_pnl=float(np.mean(list(rl_agent._recent_pnl))) if rl_agent._recent_pnl else 0.0,
         shap_top_norm=shap_top_norm,
         shap_conflict=shap_conflict_val,
+        ml_prediction=float(prediction),
+        mid_prediction=float(mid_prediction),
+        long_prediction=float(long_prediction),
+        mtf_score=float(fusion.score),
+        regime_confidence=float(regime_conf),
+        spread_norm=float(spread_norm),
+        bar_range_ratio=float(bar_range),
+        position_bias=float(position_bias),
     )
 
     sell_allowed = (
@@ -599,7 +610,6 @@ def on_tick() -> None:
             print("⏰ Session filter: no entries 19:00–20:30 UTC (NY open window)")
 
     # ── Regime filter ──────────────────────────────────────────────
-    regime, regime_conf = _get_regime()
     if regime == Regime.RANGING and regime_conf > 0.5:
         sell_allowed = buy_allowed = False
         if int(now_ts_entry) % 120 < 2:
@@ -610,9 +620,6 @@ def on_tick() -> None:
         buy_allowed = False
 
     # ── Order-flow filters: spread and bar-range ───────────────────
-    from indicators.order_flow import calculate_spread_norm, calculate_bar_range_ratio
-    spread_norm = calculate_spread_norm(SYMBOL, TIMEFRAME)
-    bar_range   = calculate_bar_range_ratio(SYMBOL, TIMEFRAME)
     if spread_norm > 1.0:
         sell_allowed = buy_allowed = False
         if int(now_ts_entry) % 60 < 2:

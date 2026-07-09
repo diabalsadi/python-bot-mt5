@@ -415,9 +415,9 @@ class TestRLAgent(unittest.TestCase):
         )
 
     def test_state_shape(self):
-        """State vector must be 10-dimensional (8 market + 2 SHAP dims)."""
+        """State vector must be 18-dimensional after expanded RL context."""
         state = self._make_state()
-        self.assertEqual(state.shape, (10,))
+        self.assertEqual(state.shape, (18,))
 
     def test_state_values_clipped(self):
         """Extreme inputs must be clipped to reasonable range."""
@@ -455,7 +455,7 @@ class TestRLAgent(unittest.TestCase):
         self.assertGreaterEqual(loss, 0.0)
 
     def test_consecutive_loss_increases_hold_tendency(self):
-        """Q[SELL] should decrease relative to Q[HOLD] after repeated SELL losses."""
+        """SELL preference should decrease relative to HOLD after repeated SELL losses."""
         from ml.rl_agent import RLAgent, BATCH_SIZE
         import numpy as np
         agent = RLAgent()
@@ -463,10 +463,10 @@ class TestRLAgent(unittest.TestCase):
 
         bad_state = self._make_state(momentum=2.0, consec=5, recent_pnl=-8.0)
 
-        # Measure Q[SELL] - Q[HOLD] before training
+        # Measure SELL logit - HOLD logit before training
         x = bad_state.reshape(1, -1).astype(np.float64)
-        q_before = agent.q_net.forward(x)[0].copy()
-        sell_hold_before = q_before[2] - q_before[0]
+        logits_before = agent.q_net.forward(x)[0].copy()
+        sell_hold_before = logits_before[2] - logits_before[0]
 
         # Fill buffer with many SELL losses and train heavily
         for _ in range(BATCH_SIZE * 10):
@@ -474,13 +474,13 @@ class TestRLAgent(unittest.TestCase):
         for _ in range(50):
             agent.learn()
 
-        q_after = agent.q_net.forward(x)[0]
-        sell_hold_after = q_after[2] - q_after[0]
+        logits_after = agent.q_net.forward(x)[0]
+        sell_hold_after = logits_after[2] - logits_after[0]
 
         # Q[SELL] should have moved DOWN relative to Q[HOLD] after loss training
         self.assertLess(
             sell_hold_after, sell_hold_before,
-            f"Q[SELL]-Q[HOLD] should decrease after loss training. "
+            f"SELL-HOLD preference should decrease after loss training. "
             f"Before={sell_hold_before:.4f} After={sell_hold_after:.4f}"
         )
 
@@ -495,7 +495,8 @@ class TestSHAPExplainer(unittest.TestCase):
             import xgboost as xgb
         except ImportError:
             return None
-        X = np.random.randn(50, 6)
+        from ml.shap_explainer import FEATURE_NAMES
+        X = np.random.randn(50, len(FEATURE_NAMES))
         y = X[:, 0] - X[:, 2] + np.random.randn(50) * 0.1
         m = xgb.XGBRegressor(n_estimators=10, verbosity=0)
         m.fit(X, y)
@@ -511,8 +512,8 @@ class TestSHAPExplainer(unittest.TestCase):
         self.assertEqual(result.top_shap_value, 0.0)
         self.assertFalse(result.conflict)
 
-    def test_explain_returns_6_shap_values(self):
-        """After fit(), shap_values should be length 6."""
+    def test_explain_returns_feature_shap_values(self):
+        """After fit(), shap_values should match the configured feature list."""
         from ml.shap_explainer import SHAPExplainer, FEATURE_NAMES
         import numpy as np
         model = self._dummy_xgb()
@@ -521,9 +522,9 @@ class TestSHAPExplainer(unittest.TestCase):
         exp = SHAPExplainer()
         exp.fit(model)
         self.assertTrue(exp.is_fitted)
-        X = np.array([0.5, 1.2, -0.3, 55.0, 0.1, 0.8])
+        X = np.random.randn(len(FEATURE_NAMES))
         result = exp.explain(X, prediction=0.3)
-        self.assertEqual(len(result.shap_values), 6)
+        self.assertEqual(len(result.shap_values), len(FEATURE_NAMES))
         self.assertIn(result.top_feature, FEATURE_NAMES)
 
     def test_conflict_detected_on_contradiction(self):
@@ -559,7 +560,7 @@ class TestSHAPExplainer(unittest.TestCase):
         self.assertIn(conflict, [0.0, 1.0])
 
     def test_state_is_10_dim_with_shap(self):
-        """build_state with shap dims must produce 10-dim vector."""
+        """build_state with shap dims must preserve SHAP positions in expanded state."""
         from datetime import datetime
         import numpy as np
         from ml.rl_agent import build_state
@@ -568,6 +569,6 @@ class TestSHAPExplainer(unittest.TestCase):
             consecutive_losses=1, open_time=datetime(2026, 5, 11, 20, 0),
             recent_pnl=-0.5, shap_top_norm=0.7, shap_conflict=1.0,
         )
-        self.assertEqual(state.shape, (10,))
+        self.assertEqual(state.shape, (18,))
         self.assertAlmostEqual(float(state[8]),  0.7, places=4)
         self.assertAlmostEqual(float(state[9]),  1.0, places=4)

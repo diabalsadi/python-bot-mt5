@@ -22,6 +22,8 @@ numpy>=1.26.0                # arrays, lstsq, all maths
 xgboost>=2.0.0               # gradient-boosted trees (replaces linear OLS)
                              # scale-invariant: splits on thresholds, not distances
                              # no StandardScaler / scikit-learn needed
+lightgbm>=4.0.0              # optional second tree backend for ensemble diversity
+scikit-learn>=1.4.0          # MLPRegressor ensemble component
 
 # ── Explainability ───────────────────────────────────────────────────
 shap>=0.44.0                 # SHAP values for XGBoost predictions

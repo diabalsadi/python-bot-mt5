@@ -23,6 +23,11 @@ class TradeFilter:
         self.MIN_LIQUIDITY = -0.30
         self.MAX_VOLATILITY = 3.0
 
+    def start_cooldown(self, seconds=None):
+        cooldown = self.MIN_SECONDS_BETWEEN_TRADES if seconds is None else float(seconds)
+        self.last_trade_time = time.time()
+        self.pause_until = max(self.pause_until, self.last_trade_time + cooldown)
+
     def register_loss(self):
         self.consecutive_losses += 1
 
